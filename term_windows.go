@@ -42,15 +42,9 @@ type rawTermState struct {
 	origOut uint32
 }
 
-func enableRawMode(_ int) (*rawTermState, error) {
-	inH, err := syscall.GetStdHandle(syscall.STD_INPUT_HANDLE)
-	if err != nil {
-		return nil, err
-	}
-	outH, err := syscall.GetStdHandle(syscall.STD_OUTPUT_HANDLE)
-	if err != nil {
-		return nil, err
-	}
+func enableRawMode(inFD, outFD int) (*rawTermState, error) {
+	inH := syscall.Handle(inFD)
+	outH := syscall.Handle(outFD)
 
 	var origIn, origOut uint32
 	r1, _, e1 := procGetConsoleMode.Call(uintptr(inH), uintptr(unsafe.Pointer(&origIn)))
@@ -93,10 +87,14 @@ type consoleScreenBufferInfo struct {
 	MaxWinSize struct{ X, Y int16 }
 }
 
-func getWinsize(_ int) (cols, rows, xpixel, ypixel int, err error) {
-	outH, err := syscall.GetStdHandle(syscall.STD_OUTPUT_HANDLE)
-	if err != nil {
-		return 0, 0, 0, 0, err
+func getWinsize(fd int) (cols, rows, xpixel, ypixel int, err error) {
+	outH := syscall.Handle(fd)
+	if fd == 0 {
+		h, gerr := syscall.GetStdHandle(syscall.STD_OUTPUT_HANDLE)
+		if gerr != nil {
+			return 0, 0, 0, 0, gerr
+		}
+		outH = h
 	}
 	var info consoleScreenBufferInfo
 	r, _, e := procGetConsoleScreenBufferInfo.Call(uintptr(outH), uintptr(unsafe.Pointer(&info)))
@@ -108,8 +106,26 @@ func getWinsize(_ int) (cols, rows, xpixel, ypixel int, err error) {
 	return c, rw, 0, 0, nil
 }
 
-func openControllingTTY() (*os.File, error) {
-	return os.OpenFile("CONIN$", os.O_RDWR, 0)
+func isConsoleInput(fd int) bool {
+	var mode uint32
+	r, _, _ := procGetConsoleMode.Call(uintptr(syscall.Handle(fd)), uintptr(unsafe.Pointer(&mode)))
+	return r != 0
+}
+
+func openControllingTTY() (in *os.File, out *os.File, closeFn func(), err error) {
+	inF, err := os.OpenFile("CONIN$", os.O_RDWR, 0)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	outF, err := os.OpenFile("CONOUT$", os.O_RDWR, 0)
+	if err != nil {
+		_ = inF.Close()
+		return nil, nil, nil, err
+	}
+	return inF, outF, func() {
+		_ = inF.Close()
+		_ = outF.Close()
+	}, nil
 }
 
 // inputRecord matches Windows INPUT_RECORD (20 bytes) so non-key console events
@@ -125,11 +141,8 @@ type inputRecord struct {
 	ControlKeyState uint32
 }
 
-func readProbeReply(_ *os.File, timeout time.Duration, stopFn func([]byte) bool) string {
-	inH, err := syscall.GetStdHandle(syscall.STD_INPUT_HANDLE)
-	if err != nil {
-		return ""
-	}
+func readProbeReply(in *os.File, timeout time.Duration, stopFn func([]byte) bool) string {
+	inH := syscall.Handle(in.Fd())
 	deadline := time.Now().Add(timeout)
 	var resp bytes.Buffer
 	var recs [32]inputRecord
@@ -139,7 +152,7 @@ func readProbeReply(_ *os.File, timeout time.Duration, stopFn func([]byte) bool)
 		var count uint32
 		r, _, _ := procGetNumberOfConsoleInputEvs.Call(uintptr(inH), uintptr(unsafe.Pointer(&count)))
 		if r == 0 || count == 0 {
-			time.Sleep(4 * time.Millisecond)
+			time.Sleep(time.Millisecond)
 			continue
 		}
 		toRead := min(uint32(len(recs)), count)

@@ -2,57 +2,53 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
 	"encoding/base64"
 	"encoding/binary"
+	"hash/adler32"
 	"hash/crc32"
-	"image"
 	"image/color"
 	"image/png"
 	"io"
 	"math"
 	"strconv"
-	"sync"
 )
 
 const (
 	kittyPlacementID   = 1
 	kittySubpixelScale = 2 // 2x2 texels per physical pixel -> 0.5px bilinear UV sub-stepping
+
+	// Fixed byte offsets inside our indexed PNG stream:
+	// [0..8)    8-byte PNG signature
+	// [8..33)   25-byte IHDR chunk
+	// [33..240) 207-byte PLTE chunk (len=195, "PLTE" at 37..41, RGB at 41..236, CRC at 236..240)
+	plteTypeOffset = 37
+	plteDataOffset = 41
+	plteDataEnd    = 236
+	plteCRCEnd     = 240
+	// 3-byte aligned slice [39..240) (67*3 = 201 bytes) maps to Base64 [52..320) (67*4 = 268 bytes).
+	plteB64SrcStart = 39
+	plteB64DstStart = (plteB64SrcStart / 3) * 4 // 52
+	plteB64DstEnd   = (plteCRCEnd / 3) * 4      // 320
 )
 
-type pngBufPool struct {
-	mu   sync.Mutex
-	bufs []*png.EncoderBuffer
-}
+var (
+	pngMagicHeader = [8]byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}
+	pngIENDChunk   = [12]byte{0x00, 0x00, 0x00, 0x00, 'I', 'E', 'N', 'D', 0xae, 0x42, 0x60, 0x82}
 
-func (p *pngBufPool) Get() *png.EncoderBuffer {
-	p.mu.Lock()
-	n := len(p.bufs)
-	if n == 0 {
-		p.mu.Unlock()
-		return &png.EncoderBuffer{}
-	}
-	b := p.bufs[n-1]
-	p.bufs = p.bufs[:n-1]
-	p.mu.Unlock()
-	return b
-}
-
-func (p *pngBufPool) Put(b *png.EncoderBuffer) {
-	p.mu.Lock()
-	p.bufs = append(p.bufs, b)
-	p.mu.Unlock()
-}
-
-// templateIndexedPalette initializes a 65-entry non-premultiplied palette (0..64 subpixel coverage)
-// so a single 1-byte/pixel PNG encode can be re-tinted for every palette color in nanoseconds by
-// patching only the 195-byte PLTE chunk + IEEE CRC32.
-var templateIndexedPalette = func() color.Palette {
-	pal := make(color.Palette, rasterMaxCoverage+1)
-	for k := 0; k <= rasterMaxCoverage; k++ {
-		pal[k] = color.NRGBA{R: 0xFF, G: 0xFF, B: 0xFF, A: covToAlpha[k]}
-	}
-	return pal
-}()
+	// Precomputed 76-byte tRNS chunk for coverage indices 0..63 (index 64 has implicit alpha 255).
+	staticIndexedTRNS = func() [76]byte {
+		var chunk [76]byte
+		binary.BigEndian.PutUint32(chunk[0:4], rasterMaxCoverage) // 64
+		copy(chunk[4:8], "tRNS")
+		for k := 0; k < rasterMaxCoverage; k++ {
+			chunk[8+k] = covToAlpha[k]
+		}
+		crc := crc32.ChecksumIEEE(chunk[4:72])
+		binary.BigEndian.PutUint32(chunk[72:76], crc)
+		return chunk
+	}()
+)
 
 // KittyRenderer manages GPU-cached supersampled logo textures and sub-pixel smooth placements
 // using the Kitty Graphics Protocol (directly or wrapped in tmux DCS passthrough).
@@ -80,11 +76,12 @@ type KittyRenderer struct {
 	prevC, prevR    int
 	prevHUD         string
 	outBuf          []byte
-	pngBuf          bytes.Buffer
+	pngBuf          []byte
+	idatBuf         bytes.Buffer
+	fw              *flate.Writer
 	idxPix          []uint8
 	b64Buf          []byte
-	palImg          image.Paletted
-	pngPool         pngBufPool
+	scratch         rasterScratch
 }
 
 func NewKittyRenderer(out io.Writer, blackBG, tmuxPassthrough bool) *KittyRenderer {
@@ -93,6 +90,7 @@ func NewKittyRenderer(out io.Writer, blackBG, tmuxPassthrough bool) *KittyRender
 		blackBG:         blackBG,
 		tmuxPassthrough: tmuxPassthrough,
 		nextBaseID:      100,
+		colorIDs:        make([]uint32, 0, 16),
 		outBuf:          make([]byte, 0, 256),
 	}
 }
@@ -118,43 +116,95 @@ func (k *KittyRenderer) resetSGR() string {
 	return "\x1b[0m"
 }
 
-// findPLTEChunk locates the PLTE chunk's 4-byte type header and RGB payload slice inside a valid PNG stream.
-func findPLTEChunk(pngBytes []byte) (typeStart, dataStart, dataEnd int, ok bool) {
-	if len(pngBytes) < 33 {
-		return 0, 0, 0, false
-	}
-	pos := 8 // skip 8-byte PNG magic header
-	for pos+12 <= len(pngBytes) {
-		length := int(binary.BigEndian.Uint32(pngBytes[pos : pos+4]))
-		if length < 0 || pos+12+length > len(pngBytes) {
-			return 0, 0, 0, false
-		}
-		if pngBytes[pos+4] == 'P' && pngBytes[pos+5] == 'L' && pngBytes[pos+6] == 'T' && pngBytes[pos+7] == 'E' {
-			if length > 0 && length%3 == 0 {
-				return pos + 4, pos + 8, pos + 8 + length, true
-			}
-			return 0, 0, 0, false
-		}
-		pos += 12 + length
-	}
-	return 0, 0, 0, false
-}
-
-// patchPLTEColor updates all RGB entries in the PLTE chunk and recomputes its 4-byte IEEE CRC32.
-func patchPLTEColor(pngBytes []byte, typeStart, dataStart, dataEnd int, col color.RGBA) {
-	plte := pngBytes[dataStart:dataEnd]
-	for i := 0; i+2 < len(plte); i += 3 {
+// patchPLTEColor updates all 65 RGB entries in the PLTE chunk and recomputes its 4-byte IEEE CRC32.
+func patchPLTEColor(pngBytes []byte, col color.RGBA) {
+	plte := pngBytes[plteDataOffset:plteDataEnd]
+	for i := 0; i < len(plte); i += 3 {
 		plte[i+0] = col.R
 		plte[i+1] = col.G
 		plte[i+2] = col.B
 	}
-	crc := crc32.ChecksumIEEE(pngBytes[typeStart:dataEnd])
-	binary.BigEndian.PutUint32(pngBytes[dataEnd:dataEnd+4], crc)
+	crc := crc32.ChecksumIEEE(pngBytes[plteTypeOffset:plteDataEnd])
+	binary.BigEndian.PutUint32(pngBytes[plteDataEnd:plteCRCEnd], crc)
 }
 
-// UploadPalette rasterizes the vector DVD logo at 2x supersampled texel density, encodes a single
-// 1-byte/pixel indexed PNG, patches PLTE+CRC32 for each palette color in-place, and uploads all
-// textures to terminal GPU memory.
+// encodeIndexedPNG builds a complete 8-bit indexed-color PNG in k.pngBuf from pre-filtered
+// row data (rowStride = texW+1 with leading 0x00 FilterNone byte per row) with 0 heap allocations
+// once internal buffers are warmed up.
+func (k *KittyRenderer) encodeIndexedPNG(texW, texH int, firstCol color.RGBA) error {
+	rawFiltered := k.idxPix[:(texW+1)*texH]
+	k.idatBuf.Reset()
+	// RFC 1950 2-byte zlib header for deflate 32K window, fastest level (0x7801 % 31 == 0).
+	k.idatBuf.WriteByte(0x78)
+	k.idatBuf.WriteByte(0x01)
+	if k.fw == nil {
+		fw, err := flate.NewWriter(&k.idatBuf, flate.BestSpeed)
+		if err != nil {
+			return err
+		}
+		k.fw = fw
+	} else {
+		k.fw.Reset(&k.idatBuf)
+	}
+	if _, err := k.fw.Write(rawFiltered); err != nil {
+		return err
+	}
+	if err := k.fw.Close(); err != nil {
+		return err
+	}
+	var adler [4]byte
+	binary.BigEndian.PutUint32(adler[:], adler32.Checksum(rawFiltered))
+	k.idatBuf.Write(adler[:])
+
+	idatData := k.idatBuf.Bytes()
+	totalLen := 316 + 12 + len(idatData) + 12
+	if cap(k.pngBuf) < totalLen {
+		k.pngBuf = make([]byte, totalLen)
+	} else {
+		k.pngBuf = k.pngBuf[:totalLen]
+	}
+	p := k.pngBuf
+
+	// 1. 8-byte PNG signature
+	copy(p[0:8], pngMagicHeader[:])
+
+	// 2. 25-byte IHDR chunk [8..33)
+	binary.BigEndian.PutUint32(p[8:12], 13)
+	copy(p[12:16], "IHDR")
+	binary.BigEndian.PutUint32(p[16:20], uint32(texW))
+	binary.BigEndian.PutUint32(p[20:24], uint32(texH))
+	p[24] = 8 // bit depth
+	p[25] = 3 // indexed-color
+	p[26] = 0 // deflate
+	p[27] = 0 // adaptive filter
+	p[28] = 0 // non-interlaced
+	binary.BigEndian.PutUint32(p[29:33], crc32.ChecksumIEEE(p[12:29]))
+
+	// 3. 207-byte PLTE chunk [33..240)
+	binary.BigEndian.PutUint32(p[33:37], uint32((rasterMaxCoverage+1)*3)) // 195
+	copy(p[plteTypeOffset:plteDataOffset], "PLTE")
+	patchPLTEColor(p, firstCol)
+
+	// 4. 76-byte static tRNS chunk [240..316)
+	copy(p[240:316], staticIndexedTRNS[:])
+
+	// 5. IDAT chunk [316 .. 316+12+len(idatData))
+	idatOff := 316
+	binary.BigEndian.PutUint32(p[idatOff:idatOff+4], uint32(len(idatData)))
+	copy(p[idatOff+4:idatOff+8], "IDAT")
+	copy(p[idatOff+8:idatOff+8+len(idatData)], idatData)
+	idatCRC := crc32.ChecksumIEEE(p[idatOff+4 : idatOff+8+len(idatData)])
+	endIDAT := idatOff + 8 + len(idatData)
+	binary.BigEndian.PutUint32(p[endIDAT:endIDAT+4], idatCRC)
+
+	// 6. 12-byte IEND chunk
+	copy(p[endIDAT+4:endIDAT+16], pngIENDChunk[:])
+	return nil
+}
+
+// UploadPalette rasterizes the vector DVD logo at 2x supersampled texel density directly into a
+// FilterNone-prefixed indexed buffer, compresses IDAT once via a pooled zlib writer, and patches
+// only the 201-byte aligned PLTE+CRC32 Base64 window for each subsequent palette color.
 func (k *KittyRenderer) UploadPalette(
 	logoW, logoH, cellW, cellH, termCols, termRows int,
 	includeVideo bool,
@@ -202,32 +252,25 @@ func (k *KittyRenderer) UploadPalette(
 	texW := marginX + cropW
 	texH := marginY + cropH
 
-	needPix := texW * texH
+	// Allocate (texW+1)*texH so byte 0 of every row is 0x00 (PNG FilterNone).
+	rowStride := texW + 1
+	needPix := rowStride * texH
 	if cap(k.idxPix) < needPix {
 		k.idxPix = make([]uint8, needPix)
 	} else {
 		k.idxPix = k.idxPix[:needPix]
 		clear(k.idxPix)
 	}
-	rasterizeDVDInto(k.idxPix, texW, marginX, marginY, sLogoW, sLogoH, includeVideo, &identityCovLUT)
+	rasterizeDVDInto(k.idxPix, rowStride, 1+marginX, marginY, sLogoW, sLogoH, includeVideo, &identityCovLUT, &k.scratch)
 
-	k.palImg = image.Paletted{
-		Pix:     k.idxPix,
-		Stride:  texW,
-		Rect:    image.Rect(0, 0, texW, texH),
-		Palette: templateIndexedPalette,
+	firstCol := flash
+	if len(palette) > 0 {
+		firstCol = palette[0]
 	}
-
-	k.pngBuf.Reset()
-	enc := png.Encoder{
-		CompressionLevel: png.BestSpeed,
-		BufferPool:       &k.pngPool,
-	}
-	if err := enc.Encode(&k.pngBuf, &k.palImg); err != nil {
+	if err := k.encodeIndexedPNG(texW, texH, firstCol); err != nil {
 		return err
 	}
-	pngBytes := k.pngBuf.Bytes()
-	typeStart, dataStart, dataEnd, hasPLTE := findPLTEChunk(pngBytes)
+	pngBytes := k.pngBuf
 
 	encLen := base64.StdEncoding.EncodedLen(len(pngBytes))
 	if cap(k.b64Buf) < encLen {
@@ -235,6 +278,9 @@ func (k *KittyRenderer) UploadPalette(
 	} else {
 		k.b64Buf = k.b64Buf[:encLen]
 	}
+	base64.StdEncoding.Encode(k.b64Buf, pngBytes)
+	b64Ready := true
+	b64Color := firstCol
 
 	base := k.nextBaseID
 	k.nextBaseID += uint32(len(palette) + 8)
@@ -246,9 +292,16 @@ func (k *KittyRenderer) UploadPalette(
 
 	var fallbackMask *LogoMask
 	emitColor := func(id uint32, col color.RGBA) error {
-		if hasPLTE && col.A == 0xFF {
-			patchPLTEColor(pngBytes, typeStart, dataStart, dataEnd, col)
-			base64.StdEncoding.Encode(k.b64Buf, pngBytes)
+		if col.A == 0xFF {
+			if !b64Ready || col != b64Color {
+				patchPLTEColor(pngBytes, col)
+				base64.StdEncoding.Encode(
+					k.b64Buf[plteB64DstStart:plteB64DstEnd],
+					pngBytes[plteB64SrcStart:plteCRCEnd],
+				)
+				b64Color = col
+				b64Ready = true
+			}
 			b = k.appendBase64Chunks(b, id, k.b64Buf)
 			return nil
 		}
@@ -256,7 +309,7 @@ func (k *KittyRenderer) UploadPalette(
 			fallbackMask = RasterizeDVDMask(sLogoW, sLogoH, includeVideo)
 		}
 		var fbBuf bytes.Buffer
-		if err := enc.Encode(&fbBuf, fallbackMask.TintPaddedRGBA(col, texW, texH, marginX, marginY)); err != nil {
+		if err := png.Encode(&fbBuf, fallbackMask.TintPaddedRGBA(col, texW, texH, marginX, marginY)); err != nil {
 			return err
 		}
 		b64 := make([]byte, base64.StdEncoding.EncodedLen(fbBuf.Len()))

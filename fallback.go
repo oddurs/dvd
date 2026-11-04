@@ -8,8 +8,8 @@ import (
 	"strconv"
 )
 
-// u8DecTable precomputes ASCII decimal strings for 0..255 so TrueColor SGR escapes
-// format without division or strconv calls on every cell.
+// u8DecTable precomputes ASCII decimal strings for 0..255 so TrueColor SGR and CUP escapes
+// format without division or strconv calls on typical terminal dimensions.
 var u8DecTable = func() [256]string {
 	var t [256]string
 	for i := 0; i < 256; i++ {
@@ -27,8 +27,44 @@ func packRGB(r, g, b uint8) uint32 {
 	return uint32(r)<<16 | uint32(g)<<8 | uint32(b)
 }
 
+// ansiColorLUT pre-bakes packed 24-bit RGB values and complete FG/BG TrueColor SGR escape
+// byte sequences for all 256 alpha levels of a palette color so inner cell rendering
+// needs zero multiplications, divisions, or multi-piece string appends.
+type ansiColorLUT struct {
+	col    color.RGBA
+	valid  bool
+	rgb    [256]uint32
+	escLen [256]uint8
+	fg     [256][20]byte
+	bg     [256][20]byte
+}
+
+func buildColorLUT(dst *ansiColorLUT, col color.RGBA) {
+	dst.col = col
+	dst.valid = true
+	colR, colG, colB := uint16(col.R), uint16(col.G), uint16(col.B)
+	for a := 0; a < 256; a++ {
+		r := uint8((colR * uint16(a)) / 255)
+		g := uint8((colG * uint16(a)) / 255)
+		b := uint8((colB * uint16(a)) / 255)
+		dst.rgb[a] = packRGB(r, g, b)
+
+		fb := append(dst.fg[a][:0], "\x1b[38;2;"...)
+		fb = append(fb, u8DecTable[r]...)
+		fb = append(fb, ';')
+		fb = append(fb, u8DecTable[g]...)
+		fb = append(fb, ';')
+		fb = append(fb, u8DecTable[b]...)
+		fb = append(fb, 'm')
+		dst.escLen[a] = uint8(len(fb))
+
+		copy(dst.bg[a][:len(fb)], fb)
+		dst.bg[a][2] = '4' // "\x1b[48;2;..."
+	}
+}
+
 // ANSIRenderer renders the vector DVD logo in terminals without Kitty graphics support,
-// using either 4x4 sub-cell anti-aliased TrueColor Unicode half-blocks (▀/▄) or classic ASCII art.
+// using either 4x4 sub-cell anti-aliased TrueColor Unicode half-blocks (▀/▄/█) or classic ASCII art.
 type ANSIRenderer struct {
 	out          io.Writer
 	mask         *LogoMask
@@ -38,6 +74,9 @@ type ANSIRenderer struct {
 	phaseRows    int
 	phaseData    []uint8
 	phaseBuilt   [32]bool
+	luts         [12]ansiColorLUT
+	lutCount     int
+	lutNext      int
 	prevCol      int
 	prevRow      int
 	prevW        int
@@ -76,6 +115,24 @@ func NewANSIRenderer(out io.Writer, asciiOnly, blackBG, noColor bool) *ANSIRende
 		noColor:   noColor,
 		outBuf:    make([]byte, 0, 8192),
 	}
+}
+
+func (a *ANSIRenderer) colorLUT(col color.RGBA) *ansiColorLUT {
+	for i := 0; i < a.lutCount; i++ {
+		if a.luts[i].col == col {
+			return &a.luts[i]
+		}
+	}
+	var slot int
+	if a.lutCount < len(a.luts) {
+		slot = a.lutCount
+		a.lutCount++
+	} else {
+		slot = a.lutNext
+		a.lutNext = (a.lutNext + 1) % len(a.luts)
+	}
+	buildColorLUT(&a.luts[slot], col)
+	return &a.luts[slot]
 }
 
 func (a *ANSIRenderer) resetSGR() string {
@@ -183,7 +240,7 @@ func (a *ANSIRenderer) ClearHUDLine(rows int) {
 
 // DrawFrame renders the logo at fractional cell coordinates (colF, rowF).
 // In TrueColor half-block mode, positions are quantized to quarter-columns x eighth-rows
-// using cached 4x4 sub-cell phase grids, cross-row SGR run-length deduplication, and differential trail erasing.
+// using cached 4x4 sub-cell phase grids, pre-baked SGR LUTs, cross-row SGR deduplication, and differential trail erasing.
 func (a *ANSIRenderer) DrawFrame(colF, rowF float64, termCols, termRows int, col color.RGBA, hud string) error {
 	if termCols < 1 || termRows < 1 {
 		return nil
@@ -317,9 +374,11 @@ func (a *ANSIRenderer) DrawFrame(colF, rowF float64, termCols, termRows int, col
 	} else if a.mask != nil {
 		grid := a.phaseGrid(remX, remY)
 		rowStride := a.phaseCols * 2
-		colR, colG, colB := uint16(col.R), uint16(col.G), uint16(col.B)
 		maxCols := min(spanCols, termCols-col0)
-		if a.noColor && curFG == sgrUnset {
+		var lut *ansiColorLUT
+		if !a.noColor {
+			lut = a.colorLUT(col)
+		} else if curFG == sgrUnset {
 			b = append(b, rst...)
 			curFG = sgrDefault
 			curBG = baseBG
@@ -355,53 +414,47 @@ func (a *ANSIRenderer) DrawFrame(colF, rowF float64, termCols, termRows int, col
 					}
 					continue
 				}
-				tr := uint8((colR * uint16(topA)) / 255)
-				tg := uint8((colG * uint16(topA)) / 255)
-				tb := uint8((colB * uint16(topA)) / 255)
-				br := uint8((colR * uint16(botA)) / 255)
-				bg := uint8((colG * uint16(botA)) / 255)
-				bb := uint8((colB * uint16(botA)) / 255)
 				if topA >= 10 && botA < 10 {
-					wantFG := packRGB(tr, tg, tb)
+					wantFG := lut.rgb[topA]
 					if curBG != baseBG {
 						b = append(b, rst...)
 						curBG = baseBG
 						curFG = sgrDefault
 					}
 					if curFG != wantFG {
-						b = appendFG(b, tr, tg, tb)
+						b = append(b, lut.fg[topA][:lut.escLen[topA]]...)
 						curFG = wantFG
 					}
 					b = append(b, "▀"...)
 				} else if topA < 10 && botA >= 10 {
-					wantFG := packRGB(br, bg, bb)
+					wantFG := lut.rgb[botA]
 					if curBG != baseBG {
 						b = append(b, rst...)
 						curBG = baseBG
 						curFG = sgrDefault
 					}
 					if curFG != wantFG {
-						b = appendFG(b, br, bg, bb)
+						b = append(b, lut.fg[botA][:lut.escLen[botA]]...)
 						curFG = wantFG
 					}
 					b = append(b, "▄"...)
 				} else {
-					wantFG := packRGB(tr, tg, tb)
-					wantBG := packRGB(br, bg, bb)
+					wantFG := lut.rgb[topA]
+					wantBG := lut.rgb[botA]
 					if wantFG == wantBG {
 						if curFG != wantFG {
-							b = appendFG(b, tr, tg, tb)
+							b = append(b, lut.fg[topA][:lut.escLen[topA]]...)
 							curFG = wantFG
 						}
 						b = append(b, "█"...)
 						continue
 					}
 					if curFG != wantFG {
-						b = appendFG(b, tr, tg, tb)
+						b = append(b, lut.fg[topA][:lut.escLen[topA]]...)
 						curFG = wantFG
 					}
 					if curBG != wantBG {
-						b = appendBG(b, br, bg, bb)
+						b = append(b, lut.bg[botA][:lut.escLen[botA]]...)
 						curBG = wantBG
 					}
 					b = append(b, "▀"...)
@@ -450,30 +503,18 @@ func (a *ANSIRenderer) DrawFrame(colF, rowF float64, termCols, termRows int, col
 
 func appendCup(b []byte, row1, col1 int) []byte {
 	b = append(b, "\x1b["...)
-	b = strconv.AppendUint(b, uint64(row1), 10)
+	if uint(row1) < 256 {
+		b = append(b, u8DecTable[row1]...)
+	} else {
+		b = strconv.AppendUint(b, uint64(row1), 10)
+	}
 	b = append(b, ';')
-	b = strconv.AppendUint(b, uint64(col1), 10)
+	if uint(col1) < 256 {
+		b = append(b, u8DecTable[col1]...)
+	} else {
+		b = strconv.AppendUint(b, uint64(col1), 10)
+	}
 	return append(b, 'H')
-}
-
-func appendFG(b []byte, r, g, bl uint8) []byte {
-	b = append(b, "\x1b[38;2;"...)
-	b = append(b, u8DecTable[r]...)
-	b = append(b, ';')
-	b = append(b, u8DecTable[g]...)
-	b = append(b, ';')
-	b = append(b, u8DecTable[bl]...)
-	return append(b, 'm')
-}
-
-func appendBG(b []byte, r, g, bl uint8) []byte {
-	b = append(b, "\x1b[48;2;"...)
-	b = append(b, u8DecTable[r]...)
-	b = append(b, ';')
-	b = append(b, u8DecTable[g]...)
-	b = append(b, ';')
-	b = append(b, u8DecTable[bl]...)
-	return append(b, 'm')
 }
 
 func appendRGB(b []byte, r, g, bl uint8) []byte {

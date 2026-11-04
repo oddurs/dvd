@@ -92,6 +92,7 @@ type rasterScratch struct {
 	bucketHead []int32
 	active     []edge
 	counts     []uint8
+	fullDelta  []int16
 	xs         []float64
 }
 
@@ -103,6 +104,7 @@ var scratchPool = sync.Pool{
 			bucketHead: make([]int32, 0, 512),
 			active:     make([]edge, 0, 32),
 			counts:     make([]uint8, 0, 1024),
+			fullDelta:  make([]int16, 0, 1025),
 			xs:         make([]float64, 0, 32),
 		}
 	},
@@ -163,7 +165,7 @@ func RasterizeDVDMask(width, height int, includeVideo bool) *LogoMask {
 		height = 2
 	}
 	alpha := make([]uint8, width*height)
-	rasterizeDVDInto(alpha, width, 0, 0, width, height, includeVideo, &covToAlpha)
+	rasterizeDVDInto(alpha, width, 0, 0, width, height, includeVideo, &covToAlpha, nil)
 	return &LogoMask{
 		Width:  width,
 		Height: height,
@@ -179,6 +181,7 @@ func rasterizeDVDInto(
 	stride, offX, offY, width, height int,
 	includeVideo bool,
 	lut *[rasterMaxCoverage + 1]uint8,
+	sc *rasterScratch,
 ) {
 	viewH := logoViewHeightNoText
 	if includeVideo {
@@ -196,7 +199,11 @@ func rasterizeDVDInto(
 	sx := (float64(width) - 2*padX) / logoViewWidth
 	sy := (float64(height) - 2*padY) / viewH
 
-	sc := scratchPool.Get().(*rasterScratch)
+	pooled := false
+	if sc == nil {
+		sc = scratchPool.Get().(*rasterScratch)
+		pooled = true
+	}
 	if cap(sc.bucketHead) < height {
 		sc.bucketHead = make([]int32, height)
 	}
@@ -249,6 +256,10 @@ func rasterizeDVDInto(
 		sc.counts = make([]uint8, width)
 	}
 	counts := sc.counts[:width]
+	if cap(sc.fullDelta) < width+1 {
+		sc.fullDelta = make([]int16, width+1)
+	}
+	fullDelta := sc.fullDelta[:width+1]
 	active := sc.active[:0]
 	xs := sc.xs[:0]
 
@@ -277,6 +288,8 @@ func rasterizeDVDInto(
 		}
 
 		clear(counts)
+		clear(fullDelta)
+		hasSpan := false
 		for syIdx := 0; syIdx < rasterSubSamples; syIdx++ {
 			scanY := pyLo + (float64(syIdx)+0.5)*(1.0/rasterSubSamples)
 			xs = xs[:0]
@@ -325,6 +338,7 @@ func rasterizeDVDInto(
 					continue
 				}
 
+				hasSpan = true
 				px0 := jLo >> 3
 				px1 := jHi >> 3
 				if px0 == px1 {
@@ -332,19 +346,26 @@ func rasterizeDVDInto(
 					continue
 				}
 				counts[px0] += uint8(rasterSubSamples - (jLo & 7))
-				for px := px0 + 1; px < px1; px++ {
-					counts[px] += rasterSubSamples
+				if px0+1 < px1 {
+					fullDelta[px0+1] += rasterSubSamples
+					fullDelta[px1] -= rasterSubSamples
 				}
 				if rem1 := jHi & 7; rem1 != 0 {
 					counts[px1] += uint8(rem1)
 				}
 			}
 		}
+		if !hasSpan {
+			continue
+		}
 
 		dstRow := dst[(py+offY)*stride+offX : (py+offY)*stride+offX+width]
+		var fullAcc int16
 		for px, c := range counts {
-			if c != 0 {
-				dstRow[px] = lut[c]
+			fullAcc += fullDelta[px]
+			total := uint8(fullAcc) + c
+			if total != 0 {
+				dstRow[px] = lut[total]
 			}
 		}
 	}
@@ -353,7 +374,9 @@ func rasterizeDVDInto(
 	sc.edgeNext = edgeNext[:0]
 	sc.active = active[:0]
 	sc.xs = xs[:0]
-	scratchPool.Put(sc)
+	if pooled {
+		scratchPool.Put(sc)
+	}
 }
 
 // TintRGBA produces a non-premultiplied RGBA image colored with col.

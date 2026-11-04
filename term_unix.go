@@ -16,11 +16,11 @@ type rawTermState struct {
 	orig syscall.Termios
 }
 
-func enableRawMode(fd int) (*rawTermState, error) {
+func enableRawMode(inFD, _ int) (*rawTermState, error) {
 	var orig syscall.Termios
 	_, _, errno := syscall.Syscall(
 		syscall.SYS_IOCTL,
-		uintptr(fd),
+		uintptr(inFD),
 		uintptr(ioctlGetTermios),
 		uintptr(unsafe.Pointer(&orig)),
 	)
@@ -38,14 +38,14 @@ func enableRawMode(fd int) (*rawTermState, error) {
 
 	_, _, errno = syscall.Syscall(
 		syscall.SYS_IOCTL,
-		uintptr(fd),
+		uintptr(inFD),
 		uintptr(ioctlSetTermios),
 		uintptr(unsafe.Pointer(&raw)),
 	)
 	if errno != 0 {
 		return nil, errno
 	}
-	return &rawTermState{fd: fd, orig: orig}, nil
+	return &rawTermState{fd: inFD, orig: orig}, nil
 }
 
 func (s *rawTermState) Restore() {
@@ -79,8 +79,17 @@ func getWinsize(fd int) (cols, rows, xpixel, ypixel int, err error) {
 	return int(ws.Col), int(ws.Row), int(ws.Xpixel), int(ws.Ypixel), nil
 }
 
-func openControllingTTY() (*os.File, error) {
-	return os.OpenFile("/dev/tty", os.O_RDWR, 0)
+func openControllingTTY() (in *os.File, out *os.File, closeFn func(), err error) {
+	f, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return f, f, func() { _ = f.Close() }, nil
+}
+
+func isConsoleInput(fd int) bool {
+	_, _, _, _, err := getWinsize(fd)
+	return err == nil
 }
 
 func readProbeReply(in *os.File, timeout time.Duration, stopFn func([]byte) bool) string {
@@ -91,17 +100,29 @@ func readProbeReply(in *os.File, timeout time.Duration, stopFn func([]byte) bool
 	deadline := time.Now().Add(timeout)
 	var resp bytes.Buffer
 	var tmp [256]byte
+	backoff := 200 * time.Microsecond
 
 	for time.Now().Before(deadline) {
 		n, err := syscall.Read(fd, tmp[:])
 		if n > 0 {
 			resp.Write(tmp[:n])
+			backoff = 200 * time.Microsecond
 			if stopFn != nil && stopFn(resp.Bytes()) {
 				break
 			}
-		} else if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-			time.Sleep(2 * time.Millisecond)
-		} else if err != nil {
+			continue
+		}
+		if err == syscall.EINTR {
+			continue
+		}
+		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+			time.Sleep(backoff)
+			if backoff < time.Millisecond {
+				backoff = min(time.Millisecond, backoff*2)
+			}
+			continue
+		}
+		if err != nil {
 			break
 		}
 	}
@@ -109,8 +130,11 @@ func readProbeReply(in *os.File, timeout time.Duration, stopFn func([]byte) bool
 }
 
 func setupSignals() (sigExit, sigWinch, sigCont chan os.Signal, stop func()) {
+	// Ignore SIGPIPE so closed PTY/SSH pipes surface as normal Write errors and run defer cleanup().
+	signal.Ignore(syscall.SIGPIPE)
+
 	sigExit = make(chan os.Signal, 2)
-	signal.Notify(sigExit, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(sigExit, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 
 	sigWinch = make(chan os.Signal, 2)
 	signal.Notify(sigWinch, syscall.SIGWINCH)

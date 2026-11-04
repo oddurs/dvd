@@ -7,10 +7,12 @@ import (
 	"image/png"
 	"io"
 	"math"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -651,6 +653,98 @@ func TestZeroAllocRenderHotPaths(t *testing.T) {
 	if predAllocs != 0 {
 		t.Fatalf("expected 0 allocs in Physics.PredictNextCorner, got %.1f", predAllocs)
 	}
+
+	// Verify steady-state KittyRenderer.UploadPalette incurs 0 heap allocations on resize/re-upload.
+	krUpload := NewKittyRenderer(io.Discard, false, false)
+	_ = krUpload.UploadPalette(320, 180, 16, 36, 120, 36, true, dvdPalette, cornerFlashColor)
+	uploadAllocs := testing.AllocsPerRun(10, func() {
+		_ = krUpload.UploadPalette(320, 180, 16, 36, 120, 36, true, dvdPalette, cornerFlashColor)
+	})
+	if uploadAllocs != 0 {
+		t.Fatalf("expected 0 steady-state allocs in KittyRenderer.UploadPalette, got %.1f", uploadAllocs)
+	}
+}
+
+func TestFramePacerJitterStabilityAndZeroSpeedDrift(t *testing.T) {
+	pacer := newFramePacer(240)
+	const target = 1.0 / 240.0
+
+	// Alternate noisy OS wakeups (7.50ms delayed tick followed by 0.833ms catch-up tick = exact 8.333ms pair).
+	var rawSum, pacedSum float64
+	var rawSqDiff, pacedSqDiff float64
+	const pairs = 600
+	for i := 0; i < pairs; i++ {
+		for _, raw := range []float64{0.0075, (2.0 * target) - 0.0075} {
+			step := pacer.NextDT(raw)
+			if step < 0.45*target || step > 1.65*target {
+				t.Fatalf("paced step %.6fs escaped smooth bounds around %.6fs", step, target)
+			}
+			rawSum += raw
+			pacedSum += step
+			rd := raw - target
+			pd := step - target
+			rawSqDiff += rd * rd
+			pacedSqDiff += pd * pd
+		}
+	}
+
+	driftRatio := math.Abs(pacedSum-rawSum) / rawSum
+	if driftRatio > 0.005 {
+		t.Fatalf("expected <0.5%% cumulative speed drift under jitter, got %.3f%% (raw=%.4fs, paced=%.4fs)",
+			driftRatio*100, rawSum, pacedSum)
+	}
+
+	rawStd := math.Sqrt(rawSqDiff / float64(pairs*2))
+	pacedStd := math.Sqrt(pacedSqDiff / float64(pairs*2))
+	if pacedStd*2.5 > rawStd {
+		t.Fatalf("expected >=2.5x lower timestep jitter stddev: raw=%.6f, paced=%.6f", rawStd, pacedStd)
+	}
+
+	// Verify 60 Hz PTY VSync backpressure adaptation: pacer locks smoothly onto 16.667ms without losing speed.
+	pacer60 := newFramePacer(240)
+	for i := 0; i < 80; i++ {
+		_ = pacer60.NextDT(1.0 / 60.0)
+	}
+	locked := pacer60.NextDT(1.0 / 60.0)
+	if math.Abs(locked-(1.0/60.0)) > 0.0005 {
+		t.Fatalf("expected pacer to lock onto 60Hz VSync (16.67ms), got %.5fs", locked)
+	}
+
+	// Verify 500ms freeze/stall is capped cleanly so logo never teleports.
+	if stallStep := pacer.NextDT(0.5); stallStep > 0.02 {
+		t.Fatalf("expected long stall to clamp to single smooth frame, got %.4fs", stallStep)
+	}
+}
+
+func TestStartInputReaderHangupEmitsQuitWithoutOrphanSpin(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	defer r.Close()
+
+	events := make(chan InputEvent, 16)
+	StartInputReader(r, events)
+
+	_, _ = w.Write([]byte("rn"))
+	_ = w.Close() // simulate PTY hangup / closed terminal tab
+
+	var got []InputAction
+	deadline := time.After(time.Second)
+	for len(got) < 3 {
+		select {
+		case ev := <-events:
+			got = append(got, ev.Action)
+		case <-deadline:
+			t.Fatalf("timed out waiting for hangup ActionQuit; got %v", got)
+		}
+	}
+	want := []InputAction{ActionRandomize, ActionNextColor, ActionQuit}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("event[%d]: got %v, want %v", i, got[i], want[i])
+		}
+	}
 }
 
 func FuzzInputParser(f *testing.F) {
@@ -682,6 +776,7 @@ func FuzzCSITwoParams(f *testing.F) {
 }
 
 func BenchmarkRasterizeDVDMask(b *testing.B) {
+	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		_ = RasterizeDVDMask(420, 237, true)
 	}
@@ -689,6 +784,8 @@ func BenchmarkRasterizeDVDMask(b *testing.B) {
 
 func BenchmarkKittyUploadPalette(b *testing.B) {
 	kr := NewKittyRenderer(io.Discard, false, false)
+	_ = kr.UploadPalette(420, 237, 16, 36, 120, 36, true, dvdPalette, cornerFlashColor)
+	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = kr.UploadPalette(420, 237, 16, 36, 120, 36, true, dvdPalette, cornerFlashColor)

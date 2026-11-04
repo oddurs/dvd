@@ -487,19 +487,31 @@ func (p *InputParser) Feed(data []byte, events chan<- InputEvent) {
 	}
 }
 
-// StartInputReader reads raw terminal bytes and dispatches parsed InputEvents with a 25ms
-// Esc disambiguation timer so split SSH/PTY escape sequences never misfire.
+type rawPacket struct {
+	buf *[256]byte
+	n   int
+}
+
+// StartInputReader reads raw terminal bytes using a preallocated zero-alloc packet ring
+// and dispatches parsed InputEvents with a 25ms Esc disambiguation timer.
+// On permanent TTY hangup/EOF, it emits ActionQuit so the main loop never spins on a dead PTY.
 func StartInputReader(in *os.File, events chan<- InputEvent) {
-	rawCh := make(chan []byte, 16)
+	var ring [8][256]byte
+	freeCh := make(chan *[256]byte, len(ring))
+	for i := range ring {
+		freeCh <- &ring[i]
+	}
+	rawCh := make(chan rawPacket, len(ring))
+
 	go func() {
 		defer close(rawCh)
-		var buf [256]byte
 		for {
+			buf := <-freeCh
 			n, err := in.Read(buf[:])
 			if n > 0 {
-				pkt := make([]byte, n)
-				copy(pkt, buf[:n])
-				rawCh <- pkt
+				rawCh <- rawPacket{buf: buf, n: n}
+			} else {
+				freeCh <- buf
 			}
 			if err != nil {
 				return
@@ -526,9 +538,14 @@ func StartInputReader(in *os.File, events chan<- InputEvent) {
 				stopTimer()
 				if !ok {
 					parser.FlushTimeout(events)
+					select {
+					case events <- InputEvent{Action: ActionQuit}:
+					default:
+					}
 					return
 				}
-				parser.Feed(pkt, events)
+				parser.Feed(pkt.buf[:pkt.n], events)
+				freeCh <- pkt.buf
 				if parser.NeedsTimeout() {
 					if escTimer == nil {
 						escTimer = time.NewTimer(escDelay)

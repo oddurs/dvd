@@ -17,7 +17,7 @@ import (
 	"unsafe"
 )
 
-const defaultVersion = "v0.5.0"
+const defaultVersion = "v0.6.0"
 
 var version = ""
 
@@ -119,24 +119,80 @@ func main() {
 	}
 }
 
+// framePacer converts noisy OS timer wakeups into steady animation timesteps while
+// tracking cumulative phase debt so transient scheduler jitter neither stutters nor loses speed,
+// and steady terminal VSync backpressure (e.g. 60/120 Hz) locks smoothly without drift.
+type framePacer struct {
+	targetDT   float64
+	smoothedDT float64
+	debt       float64
+}
+
+func newFramePacer(fps int) framePacer {
+	dt := 1.0 / float64(max(1, fps))
+	return framePacer{
+		targetDT:   dt,
+		smoothedDT: dt,
+	}
+}
+
+func (fp *framePacer) Reset() {
+	fp.smoothedDT = fp.targetDT
+	fp.debt = 0
+}
+
+func (fp *framePacer) NextDT(rawDT float64) float64 {
+	if rawDT <= 0 {
+		return 0
+	}
+	// Cap long stalls (workspace switch, window-drag freeze) so the logo never teleports.
+	if rawDT > 0.08 {
+		fp.debt = 0
+		return fp.smoothedDT
+	}
+
+	sample := clamp(rawDT, 0.25*fp.targetDT, 0.05)
+	fp.smoothedDT += (sample - fp.smoothedDT) * 0.12
+
+	fp.debt += rawDT - fp.smoothedDT
+	maxDebt := 2.5 * fp.smoothedDT
+	fp.debt = clamp(fp.debt, -maxDebt, maxDebt)
+
+	corr := clamp(fp.debt*0.25, -0.25*fp.smoothedDT, 0.25*fp.smoothedDT)
+	fp.debt -= corr
+	return clamp(fp.smoothedDT+corr, 0.5*fp.smoothedDT, 1.5*fp.smoothedDT)
+}
+
+func drainTicker(t *time.Ticker) {
+	select {
+	case <-t.C:
+	default:
+	}
+}
+
 func runScreensaver(cfg Config) error {
 	ttyIn := os.Stdin
 	ttyOut := os.Stdout
-	var openedTTY *os.File
-	if _, _, _, _, err := getWinsize(int(ttyOut.Fd())); err != nil {
-		f, openErr := openControllingTTY()
+	inOK := isConsoleInput(int(ttyIn.Fd()))
+	_, _, _, _, outErr := getWinsize(int(ttyOut.Fd()))
+	if !inOK || outErr != nil {
+		inF, outF, closeTTY, openErr := openControllingTTY()
 		if openErr != nil {
-			return fmt.Errorf("not connected to an interactive terminal (%v)", err)
+			if outErr != nil {
+				return fmt.Errorf("not connected to an interactive terminal (%v)", outErr)
+			}
+			return fmt.Errorf("not connected to an interactive terminal (%v)", openErr)
 		}
-		openedTTY = f
-		ttyIn = f
-		ttyOut = f
-	}
-	if openedTTY != nil {
-		defer openedTTY.Close()
+		defer closeTTY()
+		if !inOK {
+			ttyIn = inF
+		}
+		if outErr != nil {
+			ttyOut = outF
+		}
 	}
 
-	rawState, err := enableRawMode(int(ttyIn.Fd()))
+	rawState, err := enableRawMode(int(ttyIn.Fd()), int(ttyOut.Fd()))
 	if err != nil {
 		return fmt.Errorf("failed to enable raw terminal mode: %w", err)
 	}
@@ -154,8 +210,10 @@ func runScreensaver(cfg Config) error {
 	kitty := NewKittyRenderer(ttyOut, cfg.BlackBG, tmuxPassthrough)
 	ansi := NewANSIRenderer(ttyOut, mode == ModeASCII, cfg.BlackBG, noColor)
 
+	// Enter alternate screen (?1049h), hide cursor (?25l), and disable auto-wrap (?7l)
+	// so edge-cell draws during live window shrinking never scroll the viewport.
 	buildEnterSeq := func() string {
-		seq := "\x1b[?1049h\x1b[?25l"
+		seq := "\x1b[?1049h\x1b[?25l\x1b[?7l"
 		if cfg.Screensaver {
 			seq += "\x1b[?1003h\x1b[?1006h"
 		}
@@ -175,7 +233,7 @@ func runScreensaver(cfg Config) error {
 		if kittySupported || mode == ModeKitty {
 			kitty.ClearAll()
 		}
-		_, _ = ttyOut.WriteString("\x1b[0m\x1b[?25h\x1b[?1049l")
+		_, _ = ttyOut.WriteString("\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l")
 		rawState.Restore()
 	}
 
@@ -189,7 +247,9 @@ func runScreensaver(cfg Config) error {
 	}
 	defer cleanup()
 
-	_, _ = ttyOut.WriteString(buildEnterSeq())
+	if _, err := ttyOut.WriteString(buildEnterSeq()); err != nil {
+		return err
+	}
 
 	showStats := cfg.ShowStats
 	metrics := QueryMetrics(int(ttyOut.Fd()), csiCellW, csiCellH)
@@ -204,13 +264,12 @@ func runScreensaver(cfg Config) error {
 	sigExit, sigWinch, sigCont, stopSignals := setupSignals()
 	defer stopSignals()
 
-	inputCh := make(chan InputEvent, 32)
+	inputCh := make(chan InputEvent, 64)
 	StartInputReader(ttyIn, inputCh)
 
 	paused := false
 	frameDur := time.Second / time.Duration(cfg.FPS)
-	targetDT := 1.0 / float64(cfg.FPS)
-	smoothedDT := targetDT
+	pacer := newFramePacer(cfg.FPS)
 	ticker := time.NewTicker(frameDur)
 	defer ticker.Stop()
 
@@ -220,6 +279,7 @@ func runScreensaver(cfg Config) error {
 	var lastMouseCol, lastMouseRow int
 	var hudState hudBuilder
 	var lastETACalc time.Time
+	consecutiveWriteErrs := 0
 
 	usableRowsFor := func(rows int) int {
 		if showStats && rows >= 8 {
@@ -241,7 +301,7 @@ func runScreensaver(cfg Config) error {
 			math.Max(1, float64(max(1, uRows-lh)*metrics.CellH))
 	}
 
-	renderFrame := func(now time.Time) {
+	renderFrame := func(now time.Time) bool {
 		var hud string
 		if showStats {
 			if now.Sub(lastETACalc) > 250*time.Millisecond {
@@ -252,9 +312,10 @@ func runScreensaver(cfg Config) error {
 		}
 
 		colorIdx, flash := phys.ActiveDisplayColor()
+		var werr error
 		switch mode {
 		case ModeKitty:
-			_ = kitty.DrawFrame(phys.X, phys.Y, metrics.Cols, metrics.Rows, colorIdx, flash, hud)
+			werr = kitty.DrawFrame(phys.X, phys.Y, metrics.Cols, metrics.Rows, colorIdx, flash, hud)
 		case ModeANSI, ModeASCII:
 			col := dvdPalette[colorIdx%len(dvdPalette)]
 			if flash {
@@ -264,8 +325,17 @@ func runScreensaver(cfg Config) error {
 			lw, lh := ansi.LogoCells()
 			colF := clamp(phys.X/float64(max(1, metrics.CellW)), 0, float64(max(0, metrics.Cols-lw)))
 			rowF := clamp(phys.Y/float64(max(1, metrics.CellH)), 0, float64(max(0, uRows-lh)))
-			_ = ansi.DrawFrame(colF, rowF, metrics.Cols, metrics.Rows, col, hud)
+			werr = ansi.DrawFrame(colF, rowF, metrics.Cols, metrics.Rows, col, hud)
 		}
+		if werr != nil {
+			consecutiveWriteErrs++
+			if consecutiveWriteErrs >= 3 {
+				return false
+			}
+		} else {
+			consecutiveWriteErrs = 0
+		}
+		return true
 	}
 
 	clearHUD := func() {
@@ -276,14 +346,15 @@ func runScreensaver(cfg Config) error {
 		}
 	}
 
-	reconfigure := func(clearScreen bool) {
+	reconfigure := func(clearScreen bool) bool {
 		if clearScreen {
+			// Begin synchronized output BEFORE clearing so resize/mode-switch never flashes a blank frame.
+			bg := "\x1b[?2026h\x1b[0m"
+			if cfg.BlackBG && !noColor {
+				bg = "\x1b[?2026h\x1b[48;2;0;0;0m"
+			}
 			if mode != ModeKitty && kittySupported {
 				kitty.ClearAll()
-			}
-			bg := "\x1b[0m"
-			if cfg.BlackBG && !noColor {
-				bg = "\x1b[48;2;0;0;0m"
 			}
 			_, _ = ttyOut.WriteString(bg + "\x1b[2J\x1b[H")
 			ansi.ResetPrev()
@@ -294,18 +365,24 @@ func runScreensaver(cfg Config) error {
 		phys.UpdateBounds(maxX, maxY)
 		phys.SetSpeed(computePixelSpeed(metrics, cfg.SpeedMult))
 		lastETACalc = time.Time{}
-		renderFrame(time.Now())
+		now := time.Now()
+		ok := renderFrame(now)
+		if clearScreen {
+			_, _ = ttyOut.WriteString("\x1b[?2026l")
+		}
+		drainTicker(ticker)
+		lastTick = time.Now()
+		pacer.Reset()
+		return ok
 	}
 
-	resumeTerminal := func() {
-		if r, err := enableRawMode(int(ttyIn.Fd())); err == nil {
+	resumeTerminal := func() bool {
+		if r, err := enableRawMode(int(ttyIn.Fd()), int(ttyOut.Fd())); err == nil {
 			rawState = r
 		}
 		_, _ = ttyOut.WriteString(buildEnterSeq())
 		metrics = QueryMetrics(int(ttyOut.Fd()), csiCellW, csiCellH)
-		reconfigure(true)
-		lastTick = time.Now()
-		smoothedDT = targetDT
+		return reconfigure(true)
 	}
 
 	// Debounce timer so live window drag-resizing stays silky smooth and re-rasterizes textures once settled.
@@ -320,7 +397,154 @@ func runScreensaver(cfg Config) error {
 	}
 
 	// Render initial frame immediately.
-	renderFrame(lastTick)
+	if !renderFrame(lastTick) {
+		return nil
+	}
+
+	handleEvent := func(ev InputEvent) (exit bool, dirty bool) {
+		if ev.CellW > 0 && ev.CellH > 0 {
+			csiCellW, csiCellH = ev.CellW, ev.CellH
+			updated := QueryMetrics(int(ttyOut.Fd()), csiCellW, csiCellH)
+			if updated != metrics {
+				metrics = updated
+				scheduleReconfigure()
+			}
+			return false, false
+		}
+
+		if ev.Action == ActionMouse {
+			if !cfg.Screensaver {
+				return false, false
+			}
+			if ev.MouseMotion {
+				if !hasMousePos {
+					hasMousePos = true
+					lastMouseCol, lastMouseRow = ev.MouseCol, ev.MouseRow
+					return false, false
+				}
+				if ev.MouseCol == lastMouseCol && ev.MouseRow == lastMouseRow {
+					return false, false
+				}
+				lastMouseCol, lastMouseRow = ev.MouseCol, ev.MouseRow
+				if time.Since(startTime) >= 200*time.Millisecond {
+					return true, false
+				}
+				return false, false
+			}
+			if !ev.MouseRelease && time.Since(startTime) >= 200*time.Millisecond {
+				return true, false
+			}
+			return false, false
+		}
+
+		if cfg.Screensaver && ev.Action != ActionNone {
+			return true, false
+		}
+
+		switch ev.Action {
+		case ActionQuit:
+			return true, false
+		case ActionSuspend:
+			if resizeTimer != nil {
+				resizeTimer.Stop()
+				resizeCh = nil
+			}
+			select {
+			case <-sigCont:
+			default:
+			}
+			leaveTerminal()
+			if suspendProcess() {
+				select {
+				case <-sigCont:
+					if !resumeTerminal() {
+						return true, false
+					}
+				case <-sigExit:
+					return true, false
+				}
+			} else if !resumeTerminal() {
+				return true, false
+			}
+		case ActionRedraw:
+			metrics = QueryMetrics(int(ttyOut.Fd()), csiCellW, csiCellH)
+			if !reconfigure(true) {
+				return true, false
+			}
+		case ActionToggleStats:
+			showStats = !showStats
+			maxX, maxY = arenaBounds()
+			phys.UpdateBounds(maxX, maxY)
+			lastETACalc = time.Time{}
+			if !showStats {
+				clearHUD()
+			}
+			return false, true
+		case ActionTogglePause:
+			paused = !paused
+			drainTicker(ticker)
+			lastTick = time.Now()
+			pacer.Reset()
+			return false, true
+		case ActionAimCorner:
+			phys.AimForCorner()
+			lastETACalc = time.Time{}
+			if showStats {
+				return false, true
+			}
+		case ActionRandomize:
+			phys.Randomize()
+			lastETACalc = time.Time{}
+			return false, true
+		case ActionSpeedUp:
+			cfg.SpeedMult = math.Min(8.0, cfg.SpeedMult*1.2)
+			phys.SetSpeed(computePixelSpeed(metrics, cfg.SpeedMult))
+			lastETACalc = time.Time{}
+			if showStats {
+				return false, true
+			}
+		case ActionSpeedDown:
+			cfg.SpeedMult = math.Max(0.15, cfg.SpeedMult/1.2)
+			phys.SetSpeed(computePixelSpeed(metrics, cfg.SpeedMult))
+			lastETACalc = time.Time{}
+			if showStats {
+				return false, true
+			}
+		case ActionSizeUp:
+			cfg.Scale = math.Min(0.55, cfg.Scale*1.12)
+			if !reconfigure(mode != ModeKitty) {
+				return true, false
+			}
+		case ActionSizeDown:
+			cfg.Scale = math.Max(0.07, cfg.Scale/1.12)
+			if !reconfigure(mode != ModeKitty) {
+				return true, false
+			}
+		case ActionNextColor:
+			phys.ColorIdx = (phys.ColorIdx + 1) % len(dvdPalette)
+			return false, true
+		case ActionCycleMode:
+			switch mode {
+			case ModeKitty:
+				mode = ModeANSI
+				ansi.asciiOnly = false
+			case ModeANSI:
+				mode = ModeASCII
+				ansi.asciiOnly = true
+			case ModeASCII:
+				if kittySupported {
+					mode = ModeKitty
+				} else {
+					mode = ModeANSI
+					ansi.asciiOnly = false
+				}
+			}
+			if !reconfigure(true) {
+				return true, false
+			}
+		}
+		return false, false
+	}
 
 	for {
 		select {
@@ -328,9 +552,20 @@ func runScreensaver(cfg Config) error {
 			return nil
 
 		case <-sigCont:
-			resumeTerminal()
+			if !resumeTerminal() {
+				return nil
+			}
 
 		case <-sigWinch:
+			// Coalesce burst SIGWINCH deliveries during rapid live window drag.
+		drainWinch:
+			for {
+				select {
+				case <-sigWinch:
+				default:
+					break drainWinch
+				}
+			}
 			_, _ = ttyOut.WriteString("\x1b[16t")
 			metrics = QueryMetrics(int(ttyOut.Fd()), 0, 0)
 			if !metrics.HasPx && csiCellW > 0 && csiCellH > 0 {
@@ -341,156 +576,57 @@ func runScreensaver(cfg Config) error {
 				phys.UpdateBounds(newMaxX, newMaxY)
 				phys.SetSpeed(computePixelSpeed(metrics, cfg.SpeedMult))
 				scheduleReconfigure()
-			} else {
-				reconfigure(true)
+			} else if !reconfigure(true) {
+				return nil
 			}
 
 		case <-resizeCh:
 			resizeCh = nil
-			reconfigure(true)
+			if !reconfigure(true) {
+				return nil
+			}
 
 		case ev := <-inputCh:
-			if ev.CellW > 0 && ev.CellH > 0 {
-				csiCellW, csiCellH = ev.CellW, ev.CellH
-				updated := QueryMetrics(int(ttyOut.Fd()), csiCellW, csiCellH)
-				if updated != metrics {
-					metrics = updated
-					scheduleReconfigure()
-				}
-				continue
+			exit, dirty := handleEvent(ev)
+			if exit {
+				return nil
 			}
-
-			if ev.Action == ActionMouse {
-				if !cfg.Screensaver {
-					continue
-				}
-				if ev.MouseMotion {
-					if !hasMousePos {
-						hasMousePos = true
-						lastMouseCol, lastMouseRow = ev.MouseCol, ev.MouseRow
-						continue
-					}
-					if ev.MouseCol == lastMouseCol && ev.MouseRow == lastMouseRow {
-						continue
-					}
-					lastMouseCol, lastMouseRow = ev.MouseCol, ev.MouseRow
-					if time.Since(startTime) >= 200*time.Millisecond {
+			// Coalesce any simultaneously queued input events before rendering once.
+		drainInputs:
+			for {
+				select {
+				case nextEv := <-inputCh:
+					ex, d := handleEvent(nextEv)
+					if ex {
 						return nil
 					}
-					continue
+					dirty = dirty || d
+				default:
+					break drainInputs
 				}
-				if !ev.MouseRelease && time.Since(startTime) >= 200*time.Millisecond {
+			}
+			if dirty && paused {
+				if !renderFrame(time.Now()) {
 					return nil
 				}
-				continue
 			}
 
-			if cfg.Screensaver && ev.Action != ActionNone {
-				return nil
-			}
-
-			switch ev.Action {
-			case ActionQuit:
-				return nil
-			case ActionSuspend:
-				if resizeTimer != nil {
-					resizeTimer.Stop()
-					resizeCh = nil
-				}
-				select {
-				case <-sigCont:
-				default:
-				}
-				leaveTerminal()
-				if suspendProcess() {
-					select {
-					case <-sigCont:
-						resumeTerminal()
-					case <-sigExit:
-						return nil
-					}
-				} else {
-					resumeTerminal()
-				}
-			case ActionRedraw:
-				metrics = QueryMetrics(int(ttyOut.Fd()), csiCellW, csiCellH)
-				reconfigure(true)
-			case ActionToggleStats:
-				showStats = !showStats
-				maxX, maxY = arenaBounds()
-				phys.UpdateBounds(maxX, maxY)
-				lastETACalc = time.Time{}
-				if !showStats {
-					clearHUD()
-				}
-				renderFrame(time.Now())
-			case ActionTogglePause:
-				paused = !paused
-				lastTick = time.Now()
-				smoothedDT = targetDT
-				renderFrame(lastTick)
-			case ActionAimCorner:
-				phys.AimForCorner()
-				lastETACalc = time.Time{}
-			case ActionRandomize:
-				phys.Randomize()
-				lastETACalc = time.Time{}
-				renderFrame(time.Now())
-			case ActionSpeedUp:
-				cfg.SpeedMult = math.Min(8.0, cfg.SpeedMult*1.2)
-				phys.SetSpeed(computePixelSpeed(metrics, cfg.SpeedMult))
-				lastETACalc = time.Time{}
-			case ActionSpeedDown:
-				cfg.SpeedMult = math.Max(0.15, cfg.SpeedMult/1.2)
-				phys.SetSpeed(computePixelSpeed(metrics, cfg.SpeedMult))
-				lastETACalc = time.Time{}
-			case ActionSizeUp:
-				cfg.Scale = math.Min(0.55, cfg.Scale*1.12)
-				reconfigure(mode != ModeKitty)
-			case ActionSizeDown:
-				cfg.Scale = math.Max(0.07, cfg.Scale/1.12)
-				reconfigure(mode != ModeKitty)
-			case ActionNextColor:
-				phys.ColorIdx = (phys.ColorIdx + 1) % len(dvdPalette)
-				renderFrame(time.Now())
-			case ActionCycleMode:
-				switch mode {
-				case ModeKitty:
-					mode = ModeANSI
-					ansi.asciiOnly = false
-				case ModeANSI:
-					mode = ModeASCII
-					ansi.asciiOnly = true
-				case ModeASCII:
-					if kittySupported {
-						mode = ModeKitty
-					} else {
-						mode = ModeANSI
-						ansi.asciiOnly = false
-					}
-				}
-				reconfigure(true)
-			}
-
-		case now := <-ticker.C:
+		case <-ticker.C:
+			// Measure actual monotonic wall time now (not potentially queued channel send time).
+			now := time.Now()
 			rawDT := now.Sub(lastTick).Seconds()
 			lastTick = now
 
 			if !paused {
-				stepDT := rawDT
-				if rawDT >= 0.4*targetDT && rawDT <= 2.2*targetDT {
-					smoothedDT += (rawDT - smoothedDT) * 0.08
-					stepDT = smoothedDT
-				} else if rawDT > 2.2*targetDT {
-					smoothedDT = targetDT
-				}
-				stepEv := phys.Step(stepDT)
+				stepEv := phys.Step(pacer.NextDT(rawDT))
 				if stepEv.BouncedWall {
 					lastETACalc = time.Time{}
 				}
 			}
 
-			renderFrame(now)
+			if !renderFrame(now) {
+				return nil
+			}
 		}
 	}
 }

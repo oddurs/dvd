@@ -67,7 +67,7 @@ Respects [`NO_COLOR`](https://no-color.org/) and `tmux` DCS passthrough (`set -g
 
 ## How It Works
 
-At startup, `dvd` probes Kitty Graphics Protocol support and cell pixel dimensions (`TIOCGWINSZ` / Win32 console metrics, `CSI 16t`, `CSI 14t`), rasterizes the **DVD Video** SVG paths at 2× sub-pixel density using an 8×8 supersampled active-edge scanline rasterizer, encodes a single 1-byte/pixel indexed PNG, and patches its `PLTE` + IEEE CRC32 in-place to upload all palette textures to terminal GPU memory (`a=t,f=100`) in ~2 ms. Each frame updates a constant `(c, r)` cell box using a half-pixel sliding source crop (`x, y, w, h`) wrapped in synchronized output (`?2026h`) at 240 Hz with EMA timestep smoothing and zero heap allocations across rendering, HUD formatting, and input parsing—yielding tear-free sub-pixel motion on 60–240 Hz displays without cell-boundary stretching.
+At startup, `dvd` probes Kitty Graphics Protocol support and cell pixel dimensions (`TIOCGWINSZ` / Win32 console metrics, `CSI 16t`, `CSI 14t`), rasterizes the **DVD Video** SVG paths at 2× sub-pixel density via a 1D difference-array 8×8 supersampled active-edge rasterizer, encodes a single `FilterNone` 1-byte/px indexed PNG using a pooled `flate` + `adler32` stream, and patches only the 268-byte aligned Base64 `PLTE` + IEEE CRC32 window per palette color (`0 B/op`, `0 allocs/op` across live resizes). Each frame updates a constant `(c, r)` cell box via a half-pixel sliding source crop (`x, y, w, h`) inside synchronized output (`?2026h`) at 240 Hz with a drift-compensated phase-locked timestep pacer—yielding silky sub-pixel motion across 60–360 Hz displays with zero heap allocations on rendering, HUD formatting, or input parsing.
 
 ## License
 
