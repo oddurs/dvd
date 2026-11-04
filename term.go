@@ -5,10 +5,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 	"unicode/utf8"
-	"unsafe"
 )
 
 // TermMetrics holds character-grid and physical-pixel dimensions of the terminal viewport.
@@ -23,56 +21,8 @@ type TermMetrics struct {
 func (m TermMetrics) GridPxW() int { return m.Cols * m.CellW }
 func (m TermMetrics) GridPxH() int { return m.Rows * m.CellH }
 
-type rawTermState struct {
-	fd   int
-	orig syscall.Termios
-}
-
-func enableRawMode(fd int) (*rawTermState, error) {
-	var orig syscall.Termios
-	_, _, errno := syscall.Syscall(
-		syscall.SYS_IOCTL,
-		uintptr(fd),
-		uintptr(ioctlGetTermios),
-		uintptr(unsafe.Pointer(&orig)),
-	)
-	if errno != 0 {
-		return nil, errno
-	}
-
-	raw := orig
-	raw.Iflag &^= syscall.BRKINT | syscall.ICRNL | syscall.INPCK | syscall.ISTRIP | syscall.IXON
-	raw.Oflag &^= syscall.OPOST
-	raw.Cflag |= syscall.CS8
-	raw.Lflag &^= syscall.ECHO | syscall.ICANON | syscall.IEXTEN | syscall.ISIG
-	raw.Cc[syscall.VMIN] = 1
-	raw.Cc[syscall.VTIME] = 0
-
-	_, _, errno = syscall.Syscall(
-		syscall.SYS_IOCTL,
-		uintptr(fd),
-		uintptr(ioctlSetTermios),
-		uintptr(unsafe.Pointer(&raw)),
-	)
-	if errno != 0 {
-		return nil, errno
-	}
-	return &rawTermState{fd: fd, orig: orig}, nil
-}
-
-func (s *rawTermState) Restore() {
-	if s == nil {
-		return
-	}
-	_, _, _ = syscall.Syscall(
-		syscall.SYS_IOCTL,
-		uintptr(s.fd),
-		uintptr(ioctlSetTermios),
-		uintptr(unsafe.Pointer(&s.orig)),
-	)
-}
-
-// QueryMetrics reads TIOCGWINSZ and derives cell pixel dimensions, applying optional overrides from CSI 16t/14t.
+// QueryMetrics reads terminal window dimensions and derives cell pixel sizes,
+// applying optional overrides from CSI 16t/14t.
 func QueryMetrics(ttyFD int, csiCellW, csiCellH int) TermMetrics {
 	cols, rows, xpx, ypx, err := getWinsize(ttyFD)
 	if err != nil || cols <= 0 || rows <= 0 {
@@ -112,11 +62,17 @@ func QueryMetrics(ttyFD int, csiCellW, csiCellH int) TermMetrics {
 	}
 }
 
-// ProbeCapabilities sends a Kitty Graphics query + XTWINOPS cell/window pixel queries (CSI 16t + 14t)
-// followed by a Primary Device Attributes query (CSI c) as an in-order FIFO sentinel.
-// Because every VT100-compatible terminal answers CSI c immediately, non-Kitty terminals
-// finish probing in ~1ms without waiting for a timeout.
-func ProbeCapabilities(in *os.File, out *os.File) (kittySupported bool, cellW, cellH int) {
+// wrapTmuxDCS wraps an escape sequence for tmux DCS passthrough (`allow-passthrough on`).
+func wrapTmuxDCS(seq string) string {
+	return "\x1bPtmux;" + strings.ReplaceAll(seq, "\x1b", "\x1b\x1b") + "\x1b\\"
+}
+
+// ProbeCapabilities sends a Kitty Graphics query + XTWINOPS cell/window pixel queries (CSI 16t + 14t).
+// Outside tmux, a Primary Device Attributes query (CSI c) acts as an in-order FIFO sentinel so
+// non-Kitty terminals finish probing in ~1ms. Inside tmux, the Kitty query is wrapped in DCS passthrough.
+func ProbeCapabilities(in *os.File, out *os.File) (kittySupported, tmuxPassthrough bool, cellW, cellH int) {
+	inTmux := os.Getenv("TMUX") != ""
+	tmuxPassthrough = inTmux
 	envTerm := strings.ToLower(os.Getenv("TERM"))
 	envProg := strings.ToLower(os.Getenv("TERM_PROGRAM"))
 	envHintKitty := strings.Contains(envTerm, "kitty") ||
@@ -125,37 +81,21 @@ func ProbeCapabilities(in *os.File, out *os.File) (kittySupported bool, cellW, c
 		os.Getenv("GHOSTTY_RESOURCES_DIR") != "" ||
 		os.Getenv("KITTY_WINDOW_ID") != ""
 
-	// Query image id=31 (1x1 RGB) + CSI 16t (cell px) + CSI 14t (window px) + CSI c (DA1 sentinel).
-	const query = "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[14t\x1b[c"
-	_, _ = out.WriteString(query)
-
-	fd := int(in.Fd())
-	_ = syscall.SetNonblock(fd, true)
-	defer func() { _ = syscall.SetNonblock(fd, false) }()
-
-	deadline := time.Now().Add(120 * time.Millisecond)
-	var resp bytes.Buffer
-	var tmp [256]byte
-
-	for time.Now().Before(deadline) {
-		n, err := syscall.Read(fd, tmp[:])
-		if n > 0 {
-			resp.Write(tmp[:n])
-			// Once the DA1 response (\x1b[?...c) has arrived, all preceding FIFO responses are already in resp.
-			if hasDA1Response(resp.Bytes()) {
-				break
-			}
-		} else if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
-			time.Sleep(2 * time.Millisecond)
-		} else if err != nil {
-			break
-		}
+	const kittyQuery = "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\"
+	var raw string
+	if inTmux {
+		_, _ = out.WriteString(wrapTmuxDCS(kittyQuery) + "\x1b[16t\x1b[14t")
+		raw = readProbeReply(in, 75*time.Millisecond, func(b []byte) bool {
+			return bytes.Contains(b, []byte("\x1b_Gi=31;"))
+		})
+	} else {
+		_, _ = out.WriteString(kittyQuery + "\x1b[16t\x1b[14t\x1b[c")
+		raw = readProbeReply(in, 120*time.Millisecond, hasDA1Response)
 	}
 
-	raw := resp.String()
 	if strings.Contains(raw, "\x1b_Gi=31;OK") {
 		kittySupported = true
-	} else if envHintKitty && len(raw) == 0 {
+	} else if !inTmux && envHintKitty && len(raw) == 0 {
 		kittySupported = true
 	}
 
@@ -169,11 +109,17 @@ func ProbeCapabilities(in *os.File, out *os.File) (kittySupported bool, cellW, c
 			}
 		}
 	}
+
 	// Clean up query image id 31 in case a terminal stored it.
 	if kittySupported {
-		_, _ = out.WriteString("\x1b_Ga=d,d=I,i=31,q=2\x1b\\")
+		const delQuery = "\x1b_Ga=d,d=I,i=31,q=2\x1b\\"
+		if tmuxPassthrough {
+			_, _ = out.WriteString(wrapTmuxDCS(delQuery))
+		} else {
+			_, _ = out.WriteString(delQuery)
+		}
 	}
-	return kittySupported, cellW, cellH
+	return kittySupported, inTmux, cellW, cellH
 }
 
 func hasDA1Response(b []byte) bool {
@@ -261,11 +207,51 @@ func isAllDigits(s string) bool {
 	return true
 }
 
+// parseSGRMouse parses an SGR mouse sequence "\x1b[<Cb;Cx;CyM" or "\x1b[<Cb;Cx;Cym".
+func parseSGRMouse(seq string) (ev InputEvent, ok bool) {
+	if len(seq) < 9 || !strings.HasPrefix(seq, "\x1b[<") {
+		return InputEvent{}, false
+	}
+	final := seq[len(seq)-1]
+	if final != 'M' && final != 'm' {
+		return InputEvent{}, false
+	}
+	body := seq[3 : len(seq)-1]
+	s1 := strings.IndexByte(body, ';')
+	if s1 <= 0 {
+		return InputEvent{}, false
+	}
+	rest := body[s1+1:]
+	s2 := strings.IndexByte(rest, ';')
+	if s2 <= 0 || s2 >= len(rest)-1 {
+		return InputEvent{}, false
+	}
+	pBtn, pCol, pRow := body[:s1], rest[:s2], rest[s2+1:]
+	if !isAllDigits(pBtn) || !isAllDigits(pCol) || !isAllDigits(pRow) {
+		return InputEvent{}, false
+	}
+	btn, e1 := strconv.Atoi(pBtn)
+	col, e2 := strconv.Atoi(pCol)
+	row, e3 := strconv.Atoi(pRow)
+	if e1 != nil || e2 != nil || e3 != nil || col <= 0 || row <= 0 || col > 65535 || row > 65535 {
+		return InputEvent{}, false
+	}
+	return InputEvent{
+		Action:       ActionMouse,
+		MouseBtn:     btn,
+		MouseCol:     col,
+		MouseRow:     row,
+		MouseMotion:  (btn & 32) != 0,
+		MouseRelease: final == 'm',
+	}, true
+}
+
 type InputAction int
 
 const (
 	ActionNone InputAction = iota
 	ActionQuit
+	ActionSuspend
 	ActionToggleStats
 	ActionTogglePause
 	ActionAimCorner
@@ -277,13 +263,19 @@ const (
 	ActionNextColor
 	ActionRandomize
 	ActionRedraw
+	ActionMouse
 	ActionAnyOtherKey
 )
 
 type InputEvent struct {
-	Action InputAction
-	CellW  int
-	CellH  int
+	Action       InputAction
+	CellW        int
+	CellH        int
+	MouseBtn     int
+	MouseCol     int
+	MouseRow     int
+	MouseMotion  bool
+	MouseRelease bool
 }
 
 // InputParser reassembles raw terminal byte chunks across arbitrary Read() boundaries
@@ -339,8 +331,8 @@ func (p *InputParser) Feed(data []byte, events chan<- InputEvent) {
 			}
 			next := p.buf[1]
 
-			// APC sequence: \x1b_ ... \x1b\\ (or BEL \x07)
-			if next == '_' {
+			// APC / DCS / OSC string sequences: \x1b_ , \x1bP , \x1b] ... \x1b\\ (or BEL \x07)
+			if next == '_' || next == 'P' || next == ']' {
 				stIdx := bytes.Index(p.buf[2:], []byte("\x1b\\"))
 				belIdx := bytes.IndexByte(p.buf[2:], 0x07)
 				if stIdx >= 0 && (belIdx < 0 || stIdx < belIdx) {
@@ -383,13 +375,17 @@ func (p *InputParser) Feed(data []byte, events chan<- InputEvent) {
 					events <- InputEvent{CellW: cw, CellH: ch}
 					continue
 				}
+				if mev, ok := parseSGRMouse(seq); ok {
+					events <- mev
+					continue
+				}
 				switch seq {
 				case "\x1b[A", "\x1b[C":
 					events <- InputEvent{Action: ActionSpeedUp}
 				case "\x1b[B", "\x1b[D":
 					events <- InputEvent{Action: ActionSpeedDown}
 				}
-				// All other CSI replies (DA1, 14t, focus \x1b[I/\x1b[O, mouse SGR) are ignored cleanly.
+				// All other CSI replies (DA1, 14t, focus \x1b[I/\x1b[O) are ignored cleanly.
 				continue
 			}
 
@@ -439,6 +435,8 @@ func (p *InputParser) Feed(data []byte, events chan<- InputEvent) {
 		switch b {
 		case 3, 4, 'q', 'Q': // Ctrl+C, Ctrl+D, q
 			events <- InputEvent{Action: ActionQuit}
+		case 0x1a: // Ctrl+Z
+			events <- InputEvent{Action: ActionSuspend}
 		case 0x0c: // Ctrl+L
 			events <- InputEvent{Action: ActionRedraw}
 		case 's', 'S', 'i', 'I', '?':

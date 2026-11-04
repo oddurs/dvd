@@ -9,20 +9,23 @@ import (
 	"image/png"
 	"math"
 	"os"
-	"os/signal"
 	"runtime/debug"
 	"strings"
-	"syscall"
 	"time"
 )
 
-var version = "v0.2.0"
+const defaultVersion = "v0.3.0"
+
+var version = ""
 
 func buildVersion() string {
+	if version != "" {
+		return version
+	}
 	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
 		return info.Main.Version
 	}
-	return version
+	return defaultVersion
 }
 
 type RenderMode int
@@ -64,8 +67,8 @@ func main() {
 	flag.Float64Var(&cfg.SpeedMult, "speed", 1.0, "movement speed multiplier (e.g. 0.5, 1.0, 2.0)")
 	flag.Float64Var(&cfg.Scale, "scale", 0.21, "logo width as fraction of screen width (0.06..0.60)")
 	flag.BoolVar(&cfg.ShowStats, "stats", false, "show bottom status bar (bounces, corners, next corner ETA)")
-	flag.BoolVar(&cfg.Screensaver, "screensaver", false, "exit immediately on any keypress")
-	flag.BoolVar(&cfg.Screensaver, "x", false, "shorthand for -screensaver (exit on any key)")
+	flag.BoolVar(&cfg.Screensaver, "screensaver", false, "exit immediately on any keypress or mouse activity")
+	flag.BoolVar(&cfg.Screensaver, "x", false, "shorthand for -screensaver (exit on key/mouse)")
 	flag.BoolVar(&cfg.NoVideoLabel, "no-video", false, "omit 'VIDEO' label under the DVD disc")
 	flag.BoolVar(&cfg.BlackBG, "black", false, "force opaque pitch-black background instead of terminal default")
 	flag.BoolVar(&cfg.ShowVersion, "version", false, "print version and exit")
@@ -85,6 +88,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  n                  Cycle logo color manually\n")
 		fmt.Fprintf(os.Stderr, "  m                  Switch render mode (kitty -> ansi -> ascii)\n")
 		fmt.Fprintf(os.Stderr, "  Ctrl+L             Force full screen refresh\n")
+		fmt.Fprintf(os.Stderr, "  Ctrl+Z             Suspend to shell (resume with fg)\n")
 		fmt.Fprintf(os.Stderr, "  Space              Pause / resume\n")
 	}
 	flag.Parse()
@@ -117,7 +121,7 @@ func runScreensaver(cfg Config) error {
 	ttyOut := os.Stdout
 	var openedTTY *os.File
 	if _, _, _, _, err := getWinsize(int(ttyOut.Fd())); err != nil {
-		f, openErr := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+		f, openErr := openControllingTTY()
 		if openErr != nil {
 			return fmt.Errorf("not connected to an interactive terminal (%v)", err)
 		}
@@ -135,7 +139,7 @@ func runScreensaver(cfg Config) error {
 	}
 
 	// Probe Kitty Graphics support + exact cell pixel size BEFORE starting the input reader goroutine.
-	kittySupported, csiCellW, csiCellH := ProbeCapabilities(ttyIn, ttyOut)
+	kittySupported, tmuxPassthrough, csiCellW, csiCellH := ProbeCapabilities(ttyIn, ttyOut)
 
 	noColor := os.Getenv("NO_COLOR") != ""
 	mode, err := resolveInitialMode(cfg.ModeFlag, kittySupported, noColor)
@@ -144,8 +148,33 @@ func runScreensaver(cfg Config) error {
 		return err
 	}
 
-	kitty := NewKittyRenderer(ttyOut, cfg.BlackBG)
+	kitty := NewKittyRenderer(ttyOut, cfg.BlackBG, tmuxPassthrough)
 	ansi := NewANSIRenderer(ttyOut, mode == ModeASCII, cfg.BlackBG, noColor)
+
+	buildEnterSeq := func() string {
+		seq := "\x1b[?1049h\x1b[?25l"
+		if cfg.Screensaver {
+			seq += "\x1b[?1003h\x1b[?1006h"
+		}
+		if cfg.BlackBG && !noColor {
+			seq += "\x1b[48;2;0;0;0m"
+		} else {
+			seq += "\x1b[0m"
+		}
+		return seq + "\x1b[2J\x1b[H"
+	}
+
+	leaveTerminal := func() {
+		_, _ = ttyOut.WriteString("\x1b[?2026l")
+		if cfg.Screensaver {
+			_, _ = ttyOut.WriteString("\x1b[?1003l\x1b[?1006l")
+		}
+		if kittySupported || mode == ModeKitty {
+			kitty.ClearAll()
+		}
+		_, _ = ttyOut.WriteString("\x1b[0m\x1b[?25h\x1b[?1049l")
+		rawState.Restore()
+	}
 
 	cleanedUp := false
 	cleanup := func() {
@@ -153,55 +182,59 @@ func runScreensaver(cfg Config) error {
 			return
 		}
 		cleanedUp = true
-		_, _ = ttyOut.WriteString("\x1b[?2026l")
-		if kittySupported || mode == ModeKitty {
-			kitty.ClearAll()
-		}
-		_, _ = ttyOut.WriteString("\x1b[0m\x1b[?25h\x1b[?1049l")
-		rawState.Restore()
+		leaveTerminal()
 	}
 	defer cleanup()
 
-	// Enter alternate screen and hide cursor.
-	enterSeq := "\x1b[?1049h\x1b[?25l"
-	if cfg.BlackBG && !noColor {
-		enterSeq += "\x1b[48;2;0;0;0m"
-	} else {
-		enterSeq += "\x1b[0m"
-	}
-	enterSeq += "\x1b[2J\x1b[H"
-	_, _ = ttyOut.WriteString(enterSeq)
+	_, _ = ttyOut.WriteString(buildEnterSeq())
 
+	showStats := cfg.ShowStats
 	metrics := QueryMetrics(int(ttyOut.Fd()), csiCellW, csiCellH)
 	includeVideo := !cfg.NoVideoLabel
 
 	logoPxW, logoPxH, maxX, maxY := computeArenaAndUpload(
-		mode, metrics, cfg.Scale, includeVideo, kitty, ansi,
+		mode, metrics, cfg.Scale, includeVideo, showStats, kitty, ansi,
 	)
 	baseSpeed := computePixelSpeed(metrics, cfg.SpeedMult)
 	phys := NewPhysics(maxX, maxY, baseSpeed, len(dvdPalette))
 
-	// Set up signal handlers for clean exit and live terminal resize.
-	sigExit := make(chan os.Signal, 2)
-	signal.Notify(sigExit, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	defer signal.Stop(sigExit)
-
-	sigWinch := make(chan os.Signal, 2)
-	signal.Notify(sigWinch, syscall.SIGWINCH)
-	defer signal.Stop(sigWinch)
+	sigExit, sigWinch, sigCont, stopSignals := setupSignals()
+	defer stopSignals()
 
 	inputCh := make(chan InputEvent, 32)
 	StartInputReader(ttyIn, inputCh)
 
 	paused := false
-	showStats := cfg.ShowStats
 	frameDur := time.Second / time.Duration(cfg.FPS)
 	ticker := time.NewTicker(frameDur)
 	defer ticker.Stop()
 
-	lastTick := time.Now()
+	startTime := time.Now()
+	lastTick := startTime
+	var hasMousePos bool
+	var lastMouseCol, lastMouseRow int
 	var cachedETA string
 	var lastETACalc time.Time
+
+	usableRowsFor := func(rows int) int {
+		if showStats && rows >= 8 {
+			return rows - 1
+		}
+		return rows
+	}
+
+	arenaBounds := func() (float64, float64) {
+		uRows := usableRowsFor(metrics.Rows)
+		if mode == ModeKitty {
+			cw := max(1, kitty.cellW)
+			ch := max(1, kitty.cellH)
+			return math.Max(1, float64(metrics.Cols*cw-logoPxW)),
+				math.Max(1, float64(uRows*ch-logoPxH))
+		}
+		lw, lh := ansi.LogoCells()
+		return math.Max(1, float64(max(1, metrics.Cols-lw)*metrics.CellW)),
+			math.Max(1, float64(max(1, uRows-lh)*metrics.CellH))
+	}
 
 	renderFrame := func(now time.Time) {
 		var hud string
@@ -219,21 +252,27 @@ func runScreensaver(cfg Config) error {
 			px := int(math.Round(phys.X))
 			py := int(math.Round(phys.Y))
 			_ = kitty.DrawFrame(px, py, metrics.Cols, metrics.Rows, colorIdx, flash, hud)
-		case ModeANSI, ModeASCII:
+		case ModeANSI:
 			col := dvdPalette[colorIdx%len(dvdPalette)]
 			if flash {
 				col = cornerFlashColor
 			}
-			c0 := int(math.Round(phys.X / float64(max(1, metrics.CellW))))
-			r0 := int(math.Round(phys.Y / float64(max(1, metrics.CellH))))
+			uRows := usableRowsFor(metrics.Rows)
 			lw, lh := ansi.LogoCells()
-			if c0 > metrics.Cols-lw {
-				c0 = max(0, metrics.Cols-lw)
+			c0 := min(max(0, int(math.Round(phys.X/float64(max(1, metrics.CellW))))), max(0, metrics.Cols-lw))
+			maxHalfY := max(0, 2*(uRows-lh))
+			halfY := min(max(0, int(math.Round(phys.Y*2.0/float64(max(1, metrics.CellH))))), maxHalfY)
+			_ = ansi.DrawFrame(c0, halfY/2, halfY&1, metrics.Cols, metrics.Rows, col, hud)
+		case ModeASCII:
+			col := dvdPalette[colorIdx%len(dvdPalette)]
+			if flash {
+				col = cornerFlashColor
 			}
-			if r0 > metrics.Rows-lh {
-				r0 = max(0, metrics.Rows-lh)
-			}
-			_ = ansi.DrawFrame(c0, r0, metrics.Cols, metrics.Rows, col, hud)
+			uRows := usableRowsFor(metrics.Rows)
+			lw, lh := ansi.LogoCells()
+			c0 := min(max(0, int(math.Round(phys.X/float64(max(1, metrics.CellW))))), max(0, metrics.Cols-lw))
+			r0 := min(max(0, int(math.Round(phys.Y/float64(max(1, metrics.CellH))))), max(0, uRows-lh))
+			_ = ansi.DrawFrame(c0, r0, 0, metrics.Cols, metrics.Rows, col, hud)
 		}
 	}
 
@@ -258,12 +297,22 @@ func runScreensaver(cfg Config) error {
 			ansi.ResetPrev()
 		}
 		logoPxW, logoPxH, maxX, maxY = computeArenaAndUpload(
-			mode, metrics, cfg.Scale, includeVideo, kitty, ansi,
+			mode, metrics, cfg.Scale, includeVideo, showStats, kitty, ansi,
 		)
 		phys.UpdateBounds(maxX, maxY)
 		phys.SetSpeed(computePixelSpeed(metrics, cfg.SpeedMult))
 		lastETACalc = time.Time{}
 		renderFrame(time.Now())
+	}
+
+	resumeTerminal := func() {
+		if r, err := enableRawMode(int(ttyIn.Fd())); err == nil {
+			rawState = r
+		}
+		_, _ = ttyOut.WriteString(buildEnterSeq())
+		metrics = QueryMetrics(int(ttyOut.Fd()), csiCellW, csiCellH)
+		reconfigure(true)
+		lastTick = time.Now()
 	}
 
 	// Debounce timer so live window drag-resizing stays silky smooth and re-rasterizes textures once settled.
@@ -285,6 +334,9 @@ func runScreensaver(cfg Config) error {
 		case <-sigExit:
 			return nil
 
+		case <-sigCont:
+			resumeTerminal()
+
 		case <-sigWinch:
 			_, _ = ttyOut.WriteString("\x1b[16t")
 			metrics = QueryMetrics(int(ttyOut.Fd()), 0, 0)
@@ -293,10 +345,7 @@ func runScreensaver(cfg Config) error {
 			}
 			if mode == ModeKitty {
 				// Keep existing cached textures bouncing inside updated bounds during drag; re-upload once settled.
-				cw := max(1, kitty.cellW)
-				ch := max(1, kitty.cellH)
-				newMaxX := math.Max(1, float64(metrics.Cols*cw-logoPxW))
-				newMaxY := math.Max(1, float64(metrics.Rows*ch-logoPxH))
+				newMaxX, newMaxY := arenaBounds()
 				phys.UpdateBounds(newMaxX, newMaxY)
 				phys.SetSpeed(computePixelSpeed(metrics, cfg.SpeedMult))
 				scheduleReconfigure()
@@ -319,6 +368,31 @@ func runScreensaver(cfg Config) error {
 				continue
 			}
 
+			if ev.Action == ActionMouse {
+				if !cfg.Screensaver {
+					continue
+				}
+				if ev.MouseMotion {
+					if !hasMousePos {
+						hasMousePos = true
+						lastMouseCol, lastMouseRow = ev.MouseCol, ev.MouseRow
+						continue
+					}
+					if ev.MouseCol == lastMouseCol && ev.MouseRow == lastMouseRow {
+						continue
+					}
+					lastMouseCol, lastMouseRow = ev.MouseCol, ev.MouseRow
+					if time.Since(startTime) >= 200*time.Millisecond {
+						return nil
+					}
+					continue
+				}
+				if !ev.MouseRelease && time.Since(startTime) >= 200*time.Millisecond {
+					return nil
+				}
+				continue
+			}
+
 			if cfg.Screensaver && ev.Action != ActionNone {
 				return nil
 			}
@@ -326,11 +400,33 @@ func runScreensaver(cfg Config) error {
 			switch ev.Action {
 			case ActionQuit:
 				return nil
+			case ActionSuspend:
+				if resizeTimer != nil {
+					resizeTimer.Stop()
+					resizeCh = nil
+				}
+				select {
+				case <-sigCont:
+				default:
+				}
+				leaveTerminal()
+				if suspendProcess() {
+					select {
+					case <-sigCont:
+						resumeTerminal()
+					case <-sigExit:
+						return nil
+					}
+				} else {
+					resumeTerminal()
+				}
 			case ActionRedraw:
 				metrics = QueryMetrics(int(ttyOut.Fd()), csiCellW, csiCellH)
 				reconfigure(true)
 			case ActionToggleStats:
 				showStats = !showStats
+				maxX, maxY = arenaBounds()
+				phys.UpdateBounds(maxX, maxY)
 				lastETACalc = time.Time{}
 				if !showStats {
 					clearHUD()
@@ -425,12 +521,17 @@ func computeArenaAndUpload(
 	m TermMetrics,
 	scale float64,
 	includeVideo bool,
+	showStats bool,
 	kitty *KittyRenderer,
 	ansi *ANSIRenderer,
 ) (logoPxW, logoPxH int, maxX, maxY float64) {
 	aspect := LogoAspectRatio(includeVideo)
 	gridW := m.GridPxW()
 	gridH := m.GridPxH()
+	uRows := m.Rows
+	if showStats && uRows >= 8 {
+		uRows--
+	}
 
 	if mode == ModeKitty {
 		logoPxW = int(math.Round(float64(gridW) * scale))
@@ -451,7 +552,7 @@ func computeArenaAndUpload(
 		logoPxW = kitty.logoW
 		logoPxH = kitty.logoH
 		maxX = math.Max(1, float64(gridW-logoPxW))
-		maxY = math.Max(1, float64(gridH-logoPxH))
+		maxY = math.Max(1, float64(uRows*m.CellH-logoPxH))
 		return logoPxW, logoPxH, maxX, maxY
 	}
 
@@ -468,7 +569,7 @@ func computeArenaAndUpload(
 	ansi.ResizeLogo(colsW, rowsH, includeVideo)
 	lw, lh := ansi.LogoCells()
 	maxX = math.Max(1, float64(max(1, m.Cols-lw)*m.CellW))
-	maxY = math.Max(1, float64(max(1, m.Rows-lh)*m.CellH))
+	maxY = math.Max(1, float64(max(1, uRows-lh)*m.CellH))
 	return lw * m.CellW, lh * m.CellH, maxX, maxY
 }
 

@@ -94,7 +94,7 @@ func TestTintPaddedRGBAGeometry(t *testing.T) {
 			t.Fatalf("expected transparent margin at %v, got %+v", pt, got)
 		}
 	}
-	//Undersized canvas auto-expands so logo never clips.
+	// Undersized canvas auto-expands so logo never clips.
 	expanded := mask.TintPaddedRGBA(col, 10, 10, 5, 6)
 	if expanded.Bounds().Dx() != 85 || expanded.Bounds().Dy() != 51 {
 		t.Fatalf("expected auto-expanded bounds 85x51, got %v", expanded.Bounds())
@@ -103,7 +103,7 @@ func TestTintPaddedRGBAGeometry(t *testing.T) {
 
 func TestKittyRendererChunkingPNGValidityAndPlacements(t *testing.T) {
 	var out bytes.Buffer
-	kr := NewKittyRenderer(&out, true)
+	kr := NewKittyRenderer(&out, true, false)
 
 	pal := []color.RGBA{
 		{R: 0, G: 153, B: 255, A: 255},
@@ -210,9 +210,56 @@ func TestKittyRendererChunkingPNGValidityAndPlacements(t *testing.T) {
 	}
 }
 
+func TestKittyRendererTmuxPassthrough(t *testing.T) {
+	var out bytes.Buffer
+	kr := NewKittyRenderer(&out, false, true)
+	pal := []color.RGBA{{R: 0, G: 153, B: 255, A: 255}}
+
+	if err := kr.UploadPalette(200, 112, 10, 20, 80, 30, true, pal, cornerFlashColor); err != nil {
+		t.Fatalf("UploadPalette tmux failed: %v", err)
+	}
+
+	stream := out.String()
+	if !strings.Contains(stream, "\x1bPtmux;\x1b\x1b_Ga=d,d=A,q=2\x1b\x1b\\\x1b\\") {
+		t.Fatalf("expected tmux DCS-wrapped clear-all command in UploadPalette")
+	}
+
+	// Every DCS passthrough chunk must use <= 1024 base64 bytes and terminate cleanly with \x1b\x1b\\\x1b\\.
+	dcsBlocks := strings.Split(stream, "\x1bPtmux;\x1b\x1b_G")
+	for _, blk := range dcsBlocks[1:] {
+		end := strings.Index(blk, "\x1b\x1b\\\x1b\\")
+		if end < 0 {
+			t.Fatalf("unterminated tmux DCS passthrough block")
+		}
+		apc := blk[:end]
+		if semi := strings.IndexByte(apc, ';'); semi >= 0 {
+			payload := apc[semi+1:]
+			if len(payload) > 1024 {
+				t.Fatalf("tmux DCS payload exceeded 1024 bytes: %d", len(payload))
+			}
+		}
+	}
+
+	// DrawFrame keeps pane-relative cursor CUP unwrapped while wrapping the Kitty placement in DCS.
+	out.Reset()
+	if err := kr.DrawFrame(25, 40, 80, 30, 0, false, ""); err != nil {
+		t.Fatalf("DrawFrame tmux failed: %v", err)
+	}
+	frame := out.String()
+	if !strings.Contains(frame, "\x1b[3;3H\x1bPtmux;\x1b\x1b_Ga=p,i=100,p=1,") {
+		t.Fatalf("expected unwrapped pane CUP followed by DCS-wrapped Kitty placement, got %q", frame)
+	}
+
+	out.Reset()
+	kr.ClearAll()
+	if out.String() != "\x1bPtmux;\x1b\x1b_Ga=d,d=A,q=2\x1b\x1b\\\x1b\\" {
+		t.Fatalf("unexpected tmux ClearAll sequence: %q", out.String())
+	}
+}
+
 func TestKittyRendererFullViewportContinuitySweep(t *testing.T) {
 	var out bytes.Buffer
-	kr := NewKittyRenderer(&out, false)
+	kr := NewKittyRenderer(&out, false, false)
 	const cols, rows, cellW, cellH = 80, 28, 17, 38
 	const logoW, logoH = 290, 164
 	pal := []color.RGBA{{R: 0, G: 153, B: 255, A: 255}}
@@ -262,13 +309,14 @@ func TestKittyRendererFullViewportContinuitySweep(t *testing.T) {
 	}
 }
 
-func TestANSIRendererModesBlackBGAndNoColor(t *testing.T) {
+func TestANSIRendererModesSubRowBlackBGAndNoColor(t *testing.T) {
 	var out bytes.Buffer
 	ar := NewANSIRenderer(&out, false, true, false)
 	ar.ResizeLogo(20, 6, true)
 
 	col := dvdPalette[0]
-	if err := ar.DrawFrame(4, 2, 60, 20, col, "bounces: 3  •  corners: 1"); err != nil {
+	// Even half-row phase (oddHalf=0) spans 6 rows (rows 3..8).
+	if err := ar.DrawFrame(4, 2, 0, 60, 20, col, "bounces: 3  •  corners: 1"); err != nil {
 		t.Fatalf("DrawFrame failed: %v", err)
 	}
 	f1 := out.String()
@@ -278,20 +326,30 @@ func TestANSIRendererModesBlackBGAndNoColor(t *testing.T) {
 	if !strings.Contains(f1, "\x1b[48;2;0;0;0m") {
 		t.Fatalf("expected pitch-black background SGR when blackBG=true")
 	}
+	if ar.prevH != 6 {
+		t.Fatalf("expected prevH=6 on even half-step, got %d", ar.prevH)
+	}
 
-	// Second frame erases previous box with blackBG preserved.
+	// Odd half-row phase (oddHalf=1) shifts by 0.5 row and spans 7 rows (rows 3..9).
 	out.Reset()
-	_ = ar.DrawFrame(6, 3, 60, 20, col, "")
+	_ = ar.DrawFrame(4, 2, 1, 60, 20, col, "")
+	if ar.prevH != 7 {
+		t.Fatalf("expected prevH=7 on odd half-step, got %d", ar.prevH)
+	}
+
+	// Next frame erases all 7 rows of previous odd-phase box (including row 9) with blackBG preserved.
+	out.Reset()
+	_ = ar.DrawFrame(6, 3, 0, 60, 20, col, "")
 	f2 := out.String()
-	if !strings.Contains(f2, "\x1b[3;5H\x1b[0m\x1b[48;2;0;0;0m                    ") {
-		t.Fatalf("expected previous frame erase to preserve blackBG")
+	if !strings.Contains(f2, "\x1b[9;5H\x1b[0m\x1b[48;2;0;0;0m                    ") {
+		t.Fatalf("expected previous 7th odd-phase row (row 9) to be erased cleanly with blackBG")
 	}
 
 	// ASCII + NO_COLOR strips all RGB TrueColor sequences.
 	out.Reset()
 	asciiNoCol := NewANSIRenderer(&out, true, true, true)
 	asciiNoCol.ResizeLogo(22, 9, true)
-	_ = asciiNoCol.DrawFrame(2, 1, 50, 15, col, "bounces: 1")
+	_ = asciiNoCol.DrawFrame(2, 1, 1, 50, 15, col, "bounces: 1")
 	f3 := out.String()
 	if strings.Contains(f3, "38;2;") || strings.Contains(f3, "48;2;") || strings.Contains(f3, "38;5;") {
 		t.Fatalf("expected NO_COLOR ASCII mode to emit zero color SGR codes, got %q", f3)
@@ -314,13 +372,21 @@ func TestUTF8SafeHUDTruncation(t *testing.T) {
 	}
 }
 
-func TestStatefulInputParserSplitPacketsAndKeys(t *testing.T) {
+func TestStatefulInputParserSplitPacketsMouseAndJobControl(t *testing.T) {
 	ch := make(chan InputEvent, 32)
 	var parser InputParser
 
-	// Stream containing APC reply, CSI 16t, CSI 14t, DA1, focus in/out, SS3 Up arrow,
-	// multi-byte UTF-8 'é', Ctrl+L, 'r', 'c', and trailing lone Esc — fed ONE BYTE AT A TIME!
-	stream := []byte("\x1b_Gi=31;OK\x1b\\\x1b[6;38;17t\x1b[4;1368;2040t\x1b[?62;22c\x1b[I\x1b[O\x1bOAé\x0crc\x1b")
+	// Stream containing APC reply, DCS reply, OSC reply, CSI 16t, CSI 14t, DA1, focus in/out,
+	// SGR mouse motion + click + release, SS3 Up arrow, multi-byte UTF-8 'é', Ctrl+L, Ctrl+Z,
+	// 'r', 'c', and trailing lone Esc — fed ONE BYTE AT A TIME!
+	stream := []byte(
+		"\x1b_Gi=31;OK\x1b\\" +
+			"\x1bP1$r0m\x1b\\" +
+			"\x1b]11;rgb:1414/1616/1b1b\x07" +
+			"\x1b[6;38;17t\x1b[4;1368;2040t\x1b[?62;22c\x1b[I\x1b[O" +
+			"\x1b[<35;42;17M\x1b[<0;10;5M\x1b[<0;10;5m" +
+			"\x1bOAé\x0c\x1arc\x1b",
+	)
 	for _, b := range stream {
 		parser.Feed([]byte{b}, ch)
 	}
@@ -331,9 +397,13 @@ func TestStatefulInputParserSplitPacketsAndKeys(t *testing.T) {
 
 	want := []InputEvent{
 		{CellW: 17, CellH: 38},
+		{Action: ActionMouse, MouseBtn: 35, MouseCol: 42, MouseRow: 17, MouseMotion: true},
+		{Action: ActionMouse, MouseBtn: 0, MouseCol: 10, MouseRow: 5},
+		{Action: ActionMouse, MouseBtn: 0, MouseCol: 10, MouseRow: 5, MouseRelease: true},
 		{Action: ActionSpeedUp},
 		{Action: ActionAnyOtherKey}, // single event for 2-byte UTF-8 'é'
 		{Action: ActionRedraw},      // Ctrl+L
+		{Action: ActionSuspend},     // Ctrl+Z
 		{Action: ActionRandomize},   // 'r'
 		{Action: ActionAimCorner},   // 'c'
 		{Action: ActionQuit},        // flushed lone Esc
@@ -362,6 +432,9 @@ func TestCSIParsingAndDA1Validation(t *testing.T) {
 	}
 	if hasDA1Response([]byte("\x1b[?2026h_not_da1_c")) {
 		t.Fatalf("expected non-digit sequence with 'c' not to falsely match DA1")
+	}
+	if wrapped := wrapTmuxDCS("\x1b_Ga=d\x1b\\"); wrapped != "\x1bPtmux;\x1b\x1b_Ga=d\x1b\x1b\\\x1b\\" {
+		t.Fatalf("unexpected wrapTmuxDCS output: %q", wrapped)
 	}
 }
 
@@ -433,23 +506,28 @@ func TestPhysicsAimPredictAndCornerCelebration(t *testing.T) {
 }
 
 func TestZeroAllocRenderHotPaths(t *testing.T) {
-	kr := NewKittyRenderer(io.Discard, true)
-	_ = kr.UploadPalette(320, 180, 16, 36, 120, 36, true, dvdPalette, cornerFlashColor)
-	hud := "bounces: 12  •  corners: 1  •  next corner: 9.4s (bottom-right)"
+	for _, tmux := range []bool{false, true} {
+		kr := NewKittyRenderer(io.Discard, true, tmux)
+		_ = kr.UploadPalette(320, 180, 16, 36, 120, 36, true, dvdPalette, cornerFlashColor)
+		hud := "bounces: 12  •  corners: 1  •  next corner: 9.4s (bottom-right)"
 
-	kittyAllocs := testing.AllocsPerRun(200, func() {
-		_ = kr.DrawFrame(145, 210, 120, 36, 2, false, hud)
-	})
-	if kittyAllocs != 0 {
-		t.Fatalf("expected 0 allocs/frame in KittyRenderer.DrawFrame, got %.1f", kittyAllocs)
+		kittyAllocs := testing.AllocsPerRun(200, func() {
+			_ = kr.DrawFrame(145, 210, 120, 36, 2, false, hud)
+		})
+		if kittyAllocs != 0 {
+			t.Fatalf("expected 0 allocs/frame in KittyRenderer.DrawFrame (tmux=%v), got %.1f", tmux, kittyAllocs)
+		}
 	}
 
 	ar := NewANSIRenderer(io.Discard, false, true, false)
 	ar.ResizeLogo(24, 6, true)
-	_ = ar.DrawFrame(5, 3, 120, 36, dvdPalette[0], hud) // warm up internal buffer
+	hud := "bounces: 12  •  corners: 1  •  next corner: 9.4s (bottom-right)"
+	_ = ar.DrawFrame(5, 3, 1, 120, 36, dvdPalette[0], hud) // warm up internal buffer for oddHalf=1 span
 
+	phase := 0
 	ansiAllocs := testing.AllocsPerRun(200, func() {
-		_ = ar.DrawFrame(6, 4, 120, 36, dvdPalette[1], hud)
+		phase ^= 1
+		_ = ar.DrawFrame(6, 4, phase, 120, 36, dvdPalette[1], hud)
 	})
 	if ansiAllocs != 0 {
 		t.Fatalf("expected 0 allocs/frame in ANSIRenderer.DrawFrame, got %.1f", ansiAllocs)
@@ -458,7 +536,8 @@ func TestZeroAllocRenderHotPaths(t *testing.T) {
 
 func FuzzInputParser(f *testing.F) {
 	f.Add([]byte("\x1b_Gi=31;OK\x1b\\\x1b[6;32;16t\x1b[?62;22cq"))
-	f.Add([]byte("\x1b[A\x1b[B\x1bOA\x1b\x1b\x0c +-[ ]mnr?"))
+	f.Add([]byte("\x1b[A\x1b[B\x1bOA\x1b\x1b\x0c\x1a +-[ ]mnr?"))
+	f.Add([]byte("\x1b[<35;120;40M\x1b[<0;1;1m\x1bP1$r0m\x1b\\\x1b]11;rgb:00/00/00\x07"))
 	f.Add([]byte{0x1b, '[', '9', '9', '9', '9', '9', '9', ';', '1', 't'})
 	f.Add([]byte{0xc3, 0xa9, 0xf0, 0x9f, 0x92, 0xbf, 0xff, 0x1b, '_'})
 
@@ -473,10 +552,12 @@ func FuzzInputParser(f *testing.F) {
 func FuzzCSITwoParams(f *testing.F) {
 	f.Add("\x1b[6;36;16t")
 	f.Add("\x1b[4;1080;1920t")
+	f.Add("\x1b[<35;80;24M")
 	f.Add("\x1b[6;;t\x1b[6;999999999;1t")
 	f.Fuzz(func(t *testing.T, s string) {
 		_, _ = parseCSI16t(s)
 		_, _ = parseCSI14t(s)
+		_, _ = parseSGRMouse(s)
 		_ = hasDA1Response([]byte(s))
 	})
 }
@@ -488,7 +569,7 @@ func BenchmarkRasterizeDVDMask(b *testing.B) {
 }
 
 func BenchmarkKittyDrawFrame(b *testing.B) {
-	kr := NewKittyRenderer(io.Discard, false)
+	kr := NewKittyRenderer(io.Discard, false, false)
 	_ = kr.UploadPalette(420, 237, 16, 36, 120, 36, true, dvdPalette, cornerFlashColor)
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -500,10 +581,10 @@ func BenchmarkKittyDrawFrame(b *testing.B) {
 func BenchmarkANSIDrawFrame(b *testing.B) {
 	ar := NewANSIRenderer(io.Discard, false, false, false)
 	ar.ResizeLogo(25, 6, true)
-	_ = ar.DrawFrame(0, 0, 120, 36, dvdPalette[0], "")
+	_ = ar.DrawFrame(0, 0, 1, 120, 36, dvdPalette[0], "")
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = ar.DrawFrame(i%80, i%25, 120, 36, dvdPalette[i%8], "bounces: 5  •  corners: 0")
+		_ = ar.DrawFrame(i%80, i%25, i&1, 120, 36, dvdPalette[i%8], "bounces: 5  •  corners: 0")
 	}
 }

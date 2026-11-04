@@ -31,15 +31,27 @@ jobs:
             CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
               go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
               -o "dist/${STAGE}/dvd" .
-            cp LICENSE README.md "dist/${STAGE}/"
+            cp LICENSE README.md dvd.1 "dist/${STAGE}/"
             tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
             rm -rf "dist/${STAGE}"
           done
-          (cd dist && sha256sum *.tar.gz > checksums.txt)
+          for target in windows/amd64 windows/arm64; do
+            GOOS="${target%/*}"
+            GOARCH="${target#*/}"
+            STAGE="dvd_${VERSION#v}_${GOOS}_${GOARCH}"
+            mkdir -p "dist/${STAGE}"
+            CGO_ENABLED=0 GOOS="${GOOS}" GOARCH="${GOARCH}" \
+              go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
+              -o "dist/${STAGE}/dvd.exe" .
+            cp LICENSE README.md "dist/${STAGE}/"
+            (cd dist && zip -qr "${STAGE}.zip" "${STAGE}")
+            rm -rf "dist/${STAGE}"
+          done
+          (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/checksums.txt \
+          gh release create "${GITHUB_REF_NAME}" dist/*.tar.gz dist/*.zip dist/checksums.txt \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes

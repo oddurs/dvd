@@ -7,7 +7,7 @@ import (
 )
 
 // ANSIRenderer renders the vector DVD logo in terminals without Kitty graphics support,
-// using either TrueColor Unicode half-blocks (▀/▄) or classic retro ASCII art.
+// using either sub-row TrueColor Unicode half-blocks (▀/▄) or classic retro ASCII art.
 type ANSIRenderer struct {
 	out       io.Writer
 	mask      *LogoMask
@@ -103,7 +103,9 @@ func (a *ANSIRenderer) ClearHUDLine(rows int) {
 	}
 }
 
-func (a *ANSIRenderer) DrawFrame(col0, row0, termCols, termRows int, col color.RGBA, hud string) error {
+// DrawFrame renders the logo at cell (col0, row0) with optional half-row vertical phase
+// oddHalf in {0, 1} so half-block mode steps smoothly by 0.5-row increments.
+func (a *ANSIRenderer) DrawFrame(col0, row0, oddHalf, termCols, termRows int, col color.RGBA, hud string) error {
 	if termCols < 1 || termRows < 1 {
 		return nil
 	}
@@ -112,6 +114,11 @@ func (a *ANSIRenderer) DrawFrame(col0, row0, termCols, termRows int, col color.R
 	}
 	if row0 < 0 {
 		row0 = 0
+	}
+	if a.asciiOnly || oddHalf <= 0 {
+		oddHalf = 0
+	} else {
+		oddHalf = 1
 	}
 
 	rst := a.resetSGR()
@@ -138,6 +145,7 @@ func (a *ANSIRenderer) DrawFrame(col0, row0, termCols, termRows int, col color.R
 		}
 	}
 
+	spanRows := a.rowsH
 	if a.asciiOnly {
 		if a.noColor {
 			a.buf.WriteString("\x1b[1m")
@@ -167,7 +175,8 @@ func (a *ANSIRenderer) DrawFrame(col0, row0, termCols, termRows int, col color.R
 		}
 		a.buf.WriteString(rst)
 	} else if a.mask != nil {
-		for r := 0; r < a.rowsH; r++ {
+		spanRows = a.rowsH + oddHalf
+		for r := 0; r < spanRows; r++ {
 			ry := row0 + r + 1
 			if ry < 1 || ry > termRows {
 				continue
@@ -177,11 +186,21 @@ func (a *ANSIRenderer) DrawFrame(col0, row0, termCols, termRows int, col color.R
 				if col0+c >= termCols {
 					break
 				}
-				topA := a.mask.Sample(c, r*2)
-				botA := a.mask.Sample(c, r*2+1)
+				topA := a.mask.Sample(c, r*2-oddHalf)
+				botA := a.mask.Sample(c, r*2+1-oddHalf)
 				if topA < 32 && botA < 32 {
 					a.buf.WriteString(rst)
 					a.buf.WriteByte(' ')
+					continue
+				}
+				if a.noColor {
+					if topA >= 32 && botA < 32 {
+						a.buf.WriteString("▀")
+					} else if topA < 32 && botA >= 32 {
+						a.buf.WriteString("▄")
+					} else {
+						a.buf.WriteString("█")
+					}
 					continue
 				}
 				tr := uint8((uint16(col.R) * uint16(topA)) / 255)
@@ -230,7 +249,7 @@ func (a *ANSIRenderer) DrawFrame(col0, row0, termCols, termRows int, col color.R
 	a.prevCol = col0
 	a.prevRow = row0
 	a.prevW = a.colsW
-	a.prevH = a.rowsH
+	a.prevH = spanRows
 	a.hasPrev = true
 
 	_, err := a.out.Write(a.buf.Bytes())

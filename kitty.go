@@ -30,7 +30,7 @@ func (p *pngBufPool) Put(b *png.EncoderBuffer) {
 }
 
 // KittyRenderer manages GPU-cached logo textures and sub-cell smooth placements
-// using the Kitty Graphics Protocol.
+// using the Kitty Graphics Protocol (directly or wrapped in tmux DCS passthrough).
 //
 // Instead of relying on X=/Y= cell offsets (which cause cell-span rounding "jelly"
 // stretching in some renderers or snap jumps when reported cell pixel sizes differ
@@ -39,29 +39,48 @@ func (p *pngBufPool) Put(b *png.EncoderBuffer) {
 // That keeps the rendered cell box 100% constant while sliding smoothly pixel-by-pixel
 // across cell boundaries.
 type KittyRenderer struct {
-	out          io.Writer
-	blackBG      bool
-	nextBaseID   uint32
-	colorIDs     []uint32
-	flashID      uint32
-	activeImgID  uint32
-	logoW, logoH int
-	cellW, cellH int
-	placeCols    int
-	placeRows    int
-	cropW, cropH int
-	marginX      int
-	marginY      int
-	buf          bytes.Buffer
-	pngBuf       bytes.Buffer
-	pngPool      pngBufPool
+	out             io.Writer
+	blackBG         bool
+	tmuxPassthrough bool
+	nextBaseID      uint32
+	colorIDs        []uint32
+	flashID         uint32
+	activeImgID     uint32
+	logoW, logoH    int
+	cellW, cellH    int
+	placeCols       int
+	placeRows       int
+	cropW, cropH    int
+	marginX         int
+	marginY         int
+	buf             bytes.Buffer
+	pngBuf          bytes.Buffer
+	b64Buf          []byte
+	pngPool         pngBufPool
 }
 
-func NewKittyRenderer(out io.Writer, blackBG bool) *KittyRenderer {
+func NewKittyRenderer(out io.Writer, blackBG, tmuxPassthrough bool) *KittyRenderer {
 	return &KittyRenderer{
-		out:        out,
-		blackBG:    blackBG,
-		nextBaseID: 100,
+		out:             out,
+		blackBG:         blackBG,
+		tmuxPassthrough: tmuxPassthrough,
+		nextBaseID:      100,
+	}
+}
+
+func (k *KittyRenderer) writeAPCStart() {
+	if k.tmuxPassthrough {
+		k.buf.WriteString("\x1bPtmux;\x1b\x1b_G")
+	} else {
+		k.buf.WriteString("\x1b_G")
+	}
+}
+
+func (k *KittyRenderer) writeAPCEnd() {
+	if k.tmuxPassthrough {
+		k.buf.WriteString("\x1b\x1b\\\x1b\\")
+	} else {
+		k.buf.WriteString("\x1b\\")
 	}
 }
 
@@ -119,7 +138,9 @@ func (k *KittyRenderer) UploadPalette(
 	k.buf.Reset()
 	k.buf.WriteString("\x1b[?2026h")
 	// Delete any previous images and free terminal GPU/RAM cache.
-	k.buf.WriteString("\x1b_Ga=d,d=A,q=2\x1b\\")
+	k.writeAPCStart()
+	k.buf.WriteString("a=d,d=A,q=2")
+	k.writeAPCEnd()
 
 	mask := RasterizeDVDMask(logoW, logoH, includeVideo)
 	base := k.nextBaseID
@@ -197,9 +218,11 @@ func (k *KittyRenderer) DrawFrame(px, py, cols, rows int, colorIdx int, useFlash
 
 	if k.activeImgID != 0 && k.activeImgID != targetID {
 		// Delete only the visible placement (d=i lowercase keeps cached image texture in RAM).
-		k.buf.WriteString("\x1b_Ga=d,d=i,i=")
+		k.writeAPCStart()
+		k.buf.WriteString("a=d,d=i,i=")
 		writeUint(&k.buf, uint64(k.activeImgID))
-		k.buf.WriteString(",p=1,q=2\x1b\\")
+		k.buf.WriteString(",p=1,q=2")
+		k.writeAPCEnd()
 	}
 
 	// Anchor cell (1-indexed) + fixed c/r cell span + source rectangle crop (x,y,w,h).
@@ -209,7 +232,8 @@ func (k *KittyRenderer) DrawFrame(px, py, cols, rows int, colorIdx int, useFlash
 	writeUint(&k.buf, uint64(col0+1))
 	k.buf.WriteByte('H')
 
-	k.buf.WriteString("\x1b_Ga=p,i=")
+	k.writeAPCStart()
+	k.buf.WriteString("a=p,i=")
 	writeUint(&k.buf, uint64(targetID))
 	k.buf.WriteString(",p=")
 	writeUint(&k.buf, kittyPlacementID)
@@ -225,7 +249,8 @@ func (k *KittyRenderer) DrawFrame(px, py, cols, rows int, colorIdx int, useFlash
 	writeUint(&k.buf, uint64(c))
 	k.buf.WriteString(",r=")
 	writeUint(&k.buf, uint64(r))
-	k.buf.WriteString(",C=1,q=2\x1b\\")
+	k.buf.WriteString(",C=1,q=2")
+	k.writeAPCEnd()
 
 	if hud != "" && rows >= 2 && cols > 4 {
 		hud = truncateRunes(hud, cols-2)
@@ -260,11 +285,15 @@ func (k *KittyRenderer) ClearHUDLine(rows int) {
 
 // ClearAll removes all placements and frees cached image data from terminal memory.
 func (k *KittyRenderer) ClearAll() {
-	_, _ = io.WriteString(k.out, "\x1b_Ga=d,d=A,q=2\x1b\\")
+	if k.tmuxPassthrough {
+		_, _ = io.WriteString(k.out, "\x1bPtmux;\x1b\x1b_Ga=d,d=A,q=2\x1b\x1b\\\x1b\\")
+	} else {
+		_, _ = io.WriteString(k.out, "\x1b_Ga=d,d=A,q=2\x1b\\")
+	}
 	k.activeImgID = 0
 }
 
-// encodeKittyPNG encodes img as PNG and appends 4096-byte base64-chunked Kitty transmission commands (a=t,f=100).
+// encodeKittyPNG encodes img as PNG and appends base64-chunked Kitty transmission commands (a=t,f=100).
 func (k *KittyRenderer) encodeKittyPNG(id uint32, img image.Image) error {
 	k.pngBuf.Reset()
 	enc := png.Encoder{
@@ -276,10 +305,19 @@ func (k *KittyRenderer) encodeKittyPNG(id uint32, img image.Image) error {
 	}
 
 	encLen := base64.StdEncoding.EncodedLen(k.pngBuf.Len())
-	b64 := make([]byte, encLen)
-	base64.StdEncoding.Encode(b64, k.pngBuf.Bytes())
+	if cap(k.b64Buf) < encLen {
+		k.b64Buf = make([]byte, encLen)
+	} else {
+		k.b64Buf = k.b64Buf[:encLen]
+	}
+	base64.StdEncoding.Encode(k.b64Buf, k.pngBuf.Bytes())
+	b64 := k.b64Buf
 
-	const chunkSize = 4096
+	chunkSize := 4096
+	if k.tmuxPassthrough {
+		// Keep DCS passthrough packets compact (~1KB) for all tmux versions.
+		chunkSize = 1024
+	}
 	for offset := 0; offset < len(b64); offset += chunkSize {
 		end := offset + chunkSize
 		more := uint64(1)
@@ -287,7 +325,7 @@ func (k *KittyRenderer) encodeKittyPNG(id uint32, img image.Image) error {
 			end = len(b64)
 			more = 0
 		}
-		k.buf.WriteString("\x1b_G")
+		k.writeAPCStart()
 		if offset == 0 {
 			k.buf.WriteString("a=t,f=100,i=")
 			writeUint(&k.buf, uint64(id))
@@ -299,7 +337,7 @@ func (k *KittyRenderer) encodeKittyPNG(id uint32, img image.Image) error {
 		}
 		k.buf.WriteByte(';')
 		k.buf.Write(b64[offset:end])
-		k.buf.WriteString("\x1b\\")
+		k.writeAPCEnd()
 	}
 	return nil
 }

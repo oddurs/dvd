@@ -1,0 +1,104 @@
+.Dd November 4, 2026
+.Dt DVD 1
+.Os
+.Sh NAME
+.Nm dvd
+.Nd classic bouncing DVD Video screensaver for the terminal
+.Sh SYNOPSIS
+.Nm
+.Op Fl black
+.Op Fl fps Ar rate
+.Op Fl mode Ar mode
+.Op Fl no-video
+.Op Fl preview Ar file
+.Op Fl scale Ar ratio
+.Op Fl speed Ar mult
+.Op Fl stats
+.Op Fl v | Fl version
+.Op Fl x | Fl screensaver
+.Sh DESCRIPTION
+.Nm
+bounces the classic
+.Dq DVD Video
+logo diagonally around the terminal viewport, swapping palette colors on every
+wall bounce and flashing on exact corner hits.
+.Pp
+In terminals supporting the Kitty Graphics Protocol (such as Ghostty, Kitty,
+and WezTerm),
+.Nm
+rasterizes embedded SVG vector paths with 8x8 supersampled anti-aliasing and
+animates cached GPU textures at single-pixel precision.
+In other terminals, it falls back automatically to sub-row TrueColor Unicode
+half-blocks or ASCII art.
+.Sh OPTIONS
+.Bl -tag -width "-preview file"
+.It Fl black
+Force an opaque pitch-black background instead of the terminal default.
+.It Fl fps Ar rate
+Target frame rate in frames per second, clamped to 15..240 (default: 60).
+.It Fl mode Ar mode
+Render mode:
+.Cm auto ,
+.Cm kitty ,
+.Cm ansi ,
+or
+.Cm ascii
+(default:
+.Cm auto ) .
+.It Fl no-video
+Omit the
+.Dq VIDEO
+sub-label beneath the DVD disc.
+.It Fl preview Ar file
+Render a PNG showcase sheet of the vector logo to
+.Ar file
+and exit.
+.It Fl scale Ar ratio
+Logo width as a fraction of terminal width, 0.06..0.60 (default: 0.21).
+.It Fl speed Ar mult
+Movement speed multiplier (default: 1.0).
+.It Fl stats
+Show bottom status bar with wall bounces, corner hits, and next-corner ETA.
+.It Fl v , Fl version
+Print version and exit.
+.It Fl x , Fl screensaver
+Screensaver mode: exit immediately on any keypress, mouse click, or
+mouse movement.
+.El
+.Sh INTERACTIVE KEYS
+.Bl -tag -width "q / Esc / Ctrl+C" -compact
+.It Ic q / Esc / Ctrl+C
+Quit and restore terminal state.
+.It Ic s / ?
+Toggle bottom stats HUD and next-corner countdown.
+.It Ic c
+Subtly adjust angle so an upcoming bounce lands squarely in a corner.
+.It Ic r
+Randomize position, direction, and palette color.
+.It Ic + / - (Up / Down)
+Increase or decrease bounce speed.
+.It Ic [ / ]
+Shrink or grow logo size.
+.It Ic n
+Cycle palette color manually.
+.It Ic m
+Switch render mode live (kitty, ansi, ascii).
+.It Ic Ctrl+L
+Force full screen redraw.
+.It Ic Ctrl+Z
+Suspend to shell; resume with
+.Ic fg .
+.It Ic Space
+Pause or resume animation.
+.El
+.Sh ENVIRONMENT
+.Bl -tag -width "NO_COLOR"
+.It Ev NO_COLOR
+When set to a non-empty string, disables ANSI color sequences in
+fallback text modes.
+.It Ev TMUX
+When set, probes and wraps Kitty Graphics Protocol sequences using
+tmux DCS passthrough.
+.El
+.Sh EXIT STATUS
+.Ex -std

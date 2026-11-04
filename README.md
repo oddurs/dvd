@@ -4,9 +4,9 @@
   <img src="assets/demo.svg" alt="dvd terminal screensaver preview" width="720">
 </p>
 
-Classic bouncing **DVD Video** screensaver for the terminal—rendered as crisp vector graphics via the **Kitty Graphics Protocol** in **Ghostty**, **Kitty**, and **WezTerm**, with automatic fallback to TrueColor half-blocks (`▀`/`▄`) or ASCII everywhere else.
+Classic bouncing **DVD Video** screensaver for the terminal—rendered as crisp vector graphics via the **Kitty Graphics Protocol** in **Ghostty**, **Kitty**, and **WezTerm** (including inside `tmux` with `allow-passthrough on`), with automatic fallback to sub-row TrueColor half-blocks (`▀`/`▄`) or ASCII everywhere else.
 
-Zero external dependencies. Pure Go.
+Zero external dependencies. Pure Go. Runs on macOS, Linux, BSD, and Windows.
 
 ## Install
 
@@ -14,7 +14,7 @@ Zero external dependencies. Pure Go.
 go install github.com/oddurs/dvd@latest
 ```
 
-Or grab a prebuilt binary from [Releases](https://github.com/oddurs/dvd/releases), or build from source:
+Or grab a prebuilt archive from [Releases](https://github.com/oddurs/dvd/releases), or build from source:
 
 ```sh
 git clone https://github.com/oddurs/dvd.git
@@ -26,7 +26,7 @@ go install .
 
 ```sh
 dvd                  # run at 60 FPS (auto-detects Kitty graphics)
-dvd -x               # screensaver mode: exit on any keypress
+dvd -x               # screensaver mode: exit on any key or mouse movement
 dvd -stats           # show bounce counter & next-corner countdown
 dvd -fps 120 -black  # 120 FPS on pitch-black background
 ```
@@ -40,14 +40,14 @@ dvd -fps 120 -black  # 120 FPS on pitch-black background
   -scale float   logo width as fraction of screen width, 0.06..0.60 (default 0.21)
   -stats         show bottom status bar (bounces, corners, next corner ETA)
   -x, -screensaver
-                 exit immediately on any keypress
+                 exit immediately on any keypress or mouse activity
   -black         force opaque pitch-black background instead of terminal default
   -no-video      omit 'VIDEO' label under the DVD disc
   -preview file  render a PNG preview sheet of the vector DVD logo and exit
   -v, -version   print version and exit
 ```
 
-Respects [`NO_COLOR`](https://no-color.org/) automatically.
+Respects [`NO_COLOR`](https://no-color.org/) and `tmux` DCS passthrough (`set -g allow-passthrough on`) automatically.
 
 ### Keys
 
@@ -62,11 +62,12 @@ Respects [`NO_COLOR`](https://no-color.org/) automatically.
 | `n` | Cycle palette color |
 | `m` | Cycle render mode (`kitty` → `ansi` → `ascii`) |
 | `Ctrl+L` | Force full screen refresh |
+| `Ctrl+Z` | Suspend to shell (resume with `fg`) |
 | `Space` | Pause / resume |
 
 ## How It Works
 
-At startup, `dvd` probes Kitty Graphics Protocol support and cell pixel dimensions (`TIOCGWINSZ`, `CSI 16t`, `CSI 14t`), rasterizes the **DVD Video** SVG paths with 8×8 supersampled scanline anti-aliasing, and uploads padded palette textures to terminal GPU memory (`a=t,f=100`). Each frame updates a constant `(c, r)` cell box using a sliding source crop (`x, y, w, h`) wrapped in synchronized output (`?2026h`) with zero heap allocations per frame, yielding tear-free single-pixel diagonal motion without cell-boundary stretching.
+At startup, `dvd` probes Kitty Graphics Protocol support and cell pixel dimensions (`TIOCGWINSZ` / Win32 console metrics, `CSI 16t`, `CSI 14t`), rasterizes the **DVD Video** SVG paths with 8×8 supersampled scanline anti-aliasing, and uploads padded palette textures to terminal GPU memory (`a=t,f=100`). Each frame updates a constant `(c, r)` cell box using a sliding source crop (`x, y, w, h`) wrapped in synchronized output (`?2026h`) with zero heap allocations per frame, yielding tear-free single-pixel diagonal motion without cell-boundary stretching.
 
 ## License
 
