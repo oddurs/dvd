@@ -16,6 +16,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
+          cache: false
       - name: Run tests before release
         run: go test -race ./...
       - name: Build release archives
