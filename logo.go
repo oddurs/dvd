@@ -3,8 +3,6 @@ package main
 import (
 	"image"
 	"image/color"
-	"math"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,7 +42,27 @@ const (
 	logoViewWidth        = 160.5
 	logoViewHeightVideo  = 90.5
 	logoViewHeightNoText = 73.0
+	rasterSubSamples     = 8
+	rasterMaxCoverage    = rasterSubSamples * rasterSubSamples // 64
 )
+
+// covToAlpha maps 8x8 subpixel coverage counts (0..64) directly to 0..255 alpha without float division.
+var covToAlpha = func() [rasterMaxCoverage + 1]uint8 {
+	var lut [rasterMaxCoverage + 1]uint8
+	for c := 0; c <= rasterMaxCoverage; c++ {
+		lut[c] = uint8((c*255 + rasterMaxCoverage/2) / rasterMaxCoverage)
+	}
+	return lut
+}()
+
+// identityCovLUT preserves raw 0..64 subpixel coverage indices for 1-byte/px indexed PNG encoding.
+var identityCovLUT = func() [rasterMaxCoverage + 1]uint8 {
+	var lut [rasterMaxCoverage + 1]uint8
+	for c := 0; c <= rasterMaxCoverage; c++ {
+		lut[c] = uint8(c)
+	}
+	return lut
+}()
 
 // Palette of classic vibrant DVD screensaver colors.
 var dvdPalette = []color.RGBA{
@@ -65,7 +83,29 @@ type pt struct {
 }
 
 type edge struct {
-	x0, y0, x1, y1 float64
+	x0, y0, y1, slope float64
+}
+
+type rasterScratch struct {
+	edges      []edge
+	edgeNext   []int32
+	bucketHead []int32
+	active     []edge
+	counts     []uint8
+	xs         []float64
+}
+
+var scratchPool = sync.Pool{
+	New: func() any {
+		return &rasterScratch{
+			edges:      make([]edge, 0, 320),
+			edgeNext:   make([]int32, 0, 320),
+			bucketHead: make([]int32, 0, 512),
+			active:     make([]edge, 0, 32),
+			counts:     make([]uint8, 0, 1024),
+			xs:         make([]float64, 0, 32),
+		}
+	},
 }
 
 var (
@@ -85,11 +125,11 @@ func cachedDVDPolygons(includeVideo bool) [][]pt {
 	return polysNoText
 }
 
-// LogoMask stores a supersampled alpha mask of the DVD vector logo at target pixel dimensions.
+// LogoMask stores a supersampled alpha mask of the DVD vector logo.
 type LogoMask struct {
 	Width  int
 	Height int
-	Alpha  []uint8 // len = Width * Height, row-major
+	Alpha  []uint8 // len = Width * Height, 0..255
 }
 
 // LogoAspectRatio returns width / height for the vector logo.
@@ -100,8 +140,21 @@ func LogoAspectRatio(includeVideo bool) float64 {
 	return logoViewWidth / logoViewHeightNoText
 }
 
+// sortFloats sorts small intersection slices in-place with zero heap allocations.
+func sortFloats(xs []float64) {
+	for i := 1; i < len(xs); i++ {
+		v := xs[i]
+		j := i - 1
+		for j >= 0 && xs[j] > v {
+			xs[j+1] = xs[j]
+			j--
+		}
+		xs[j+1] = v
+	}
+}
+
 // RasterizeDVDMask renders the vector DVD logo onto an anti-aliased alpha mask of size width x height
-// using 8x8 supersampled scanline coverage.
+// using 8x8 supersampled scanline coverage with a Y-bucketed Active Edge Table and O(1) span integration.
 func RasterizeDVDMask(width, height int, includeVideo bool) *LogoMask {
 	if width < 4 {
 		width = 4
@@ -109,7 +162,24 @@ func RasterizeDVDMask(width, height int, includeVideo bool) *LogoMask {
 	if height < 2 {
 		height = 2
 	}
+	alpha := make([]uint8, width*height)
+	rasterizeDVDInto(alpha, width, 0, 0, width, height, includeVideo, &covToAlpha)
+	return &LogoMask{
+		Width:  width,
+		Height: height,
+		Alpha:  alpha,
+	}
+}
 
+// rasterizeDVDInto renders the vector DVD logo of size width x height directly into dst at
+// (offX, offY) with row stride `stride`, mapping non-zero 0..64 coverage counts through lut.
+// Caller must ensure dst in the target rectangle is zero-initialized.
+func rasterizeDVDInto(
+	dst []uint8,
+	stride, offX, offY, width, height int,
+	includeVideo bool,
+	lut *[rasterMaxCoverage + 1]uint8,
+) {
 	viewH := logoViewHeightNoText
 	if includeVideo {
 		viewH = logoViewHeightVideo
@@ -126,90 +196,167 @@ func RasterizeDVDMask(width, height int, includeVideo bool) *LogoMask {
 	sx := (float64(width) - 2*padX) / logoViewWidth
 	sy := (float64(height) - 2*padY) / viewH
 
-	var edges []edge
+	sc := scratchPool.Get().(*rasterScratch)
+	if cap(sc.bucketHead) < height {
+		sc.bucketHead = make([]int32, height)
+	}
+	bucketHead := sc.bucketHead[:height]
+	for i := range bucketHead {
+		bucketHead[i] = -1
+	}
+
+	edges := sc.edges[:0]
+	edgeNext := sc.edgeNext[:0]
+	fHeight := float64(height)
+
 	for _, poly := range polys {
 		if len(poly) < 2 {
 			continue
 		}
+		a := poly[len(poly)-1]
+		x0, y0 := a.x*sx+padX, a.y*sy+padY
 		for i := 0; i < len(poly); i++ {
-			a := poly[i]
-			b := poly[(i+1)%len(poly)]
-			x0, y0 := a.x*sx+padX, a.y*sy+padY
+			b := poly[i]
 			x1, y1 := b.x*sx+padX, b.y*sy+padY
-			if y0 == y1 {
-				continue // Horizontal edges don't cross horizontal scanlines.
+			if y0 != y1 {
+				ex0, ey0, ex1, ey1 := x0, y0, x1, y1
+				if ey0 > ey1 {
+					ex0, ey0, ex1, ey1 = ex1, ey1, ex0, ey0
+				}
+				if ey1 > 0 && ey0 < fHeight {
+					startRow := 0
+					if ey0 > 0 {
+						startRow = int(ey0)
+					}
+					if startRow < height {
+						idx := int32(len(edges))
+						edges = append(edges, edge{
+							x0:    ex0,
+							y0:    ey0,
+							y1:    ey1,
+							slope: (ex1 - ex0) / (ey1 - ey0),
+						})
+						edgeNext = append(edgeNext, bucketHead[startRow])
+						bucketHead[startRow] = idx
+					}
+				}
 			}
-			if y0 > y1 {
-				x0, y0, x1, y1 = x1, y1, x0, y0
-			}
-			edges = append(edges, edge{x0: x0, y0: y0, x1: x1, y1: y1})
+			x0, y0 = x1, y1
 		}
 	}
 
-	const sub = 8 // 8x8 = 64 subpixel samples per pixel
-	alpha := make([]uint8, width*height)
-	counts := make([]int, width)
-	var xs []float64
+	if cap(sc.counts) < width {
+		sc.counts = make([]uint8, width)
+	}
+	counts := sc.counts[:width]
+	active := sc.active[:0]
+	xs := sc.xs[:0]
+
+	maxSubX := width * rasterSubSamples
+	fWidth := float64(width)
 
 	for py := 0; py < height; py++ {
+		for eIdx := bucketHead[py]; eIdx >= 0; eIdx = edgeNext[eIdx] {
+			active = append(active, edges[eIdx])
+		}
+		if len(active) == 0 {
+			continue
+		}
+
+		pyLo := float64(py)
+		keep := 0
+		for _, e := range active {
+			if e.y1 > pyLo {
+				active[keep] = e
+				keep++
+			}
+		}
+		active = active[:keep]
+		if len(active) < 2 {
+			continue
+		}
+
 		clear(counts)
-		for syIdx := 0; syIdx < sub; syIdx++ {
-			scanY := float64(py) + (float64(syIdx)+0.5)/float64(sub)
+		for syIdx := 0; syIdx < rasterSubSamples; syIdx++ {
+			scanY := pyLo + (float64(syIdx)+0.5)*(1.0/rasterSubSamples)
 			xs = xs[:0]
-			for _, e := range edges {
+			for _, e := range active {
 				if scanY >= e.y0 && scanY < e.y1 {
-					t := (scanY - e.y0) / (e.y1 - e.y0)
-					xs = append(xs, e.x0+t*(e.x1-e.x0))
+					xs = append(xs, e.x0+(scanY-e.y0)*e.slope)
 				}
 			}
 			if len(xs) < 2 {
 				continue
 			}
-			sort.Float64s(xs)
+			sortFloats(xs)
 			// Even-odd fill rule pairs intersections (0,1), (2,3), ...
 			for i := 0; i+1 < len(xs); i += 2 {
 				left := xs[i]
 				right := xs[i+1]
-				if right <= 0 || left >= float64(width) {
+				if right <= 0 || left >= fWidth {
 					continue
 				}
-				minPx := max(0, int(math.Floor(left)))
-				maxPx := min(width, int(math.Ceil(right)))
-				for px := minPx; px < maxPx; px++ {
-					pxLo := float64(px)
-					pxHi := float64(px + 1)
-					// Fast path: full pixel span lies strictly inside [left, right).
-					if pxLo >= left && pxHi <= right {
-						counts[px] += sub
-						continue
-					}
-					for sxIdx := 0; sxIdx < sub; sxIdx++ {
-						sampleX := pxLo + (float64(sxIdx)+0.5)/float64(sub)
-						if sampleX >= left && sampleX < right {
-							counts[px]++
-						}
-					}
+				if left < 0 {
+					left = 0
+				}
+				if right > fWidth {
+					right = fWidth
+				}
+
+				// Subpixel sample j (0..maxSubX-1) has center (j + 0.5)/8 in [left, right)
+				// iff ceil(left*8 - 0.5) <= j < ceil(right*8 - 0.5).
+				uLo := left*rasterSubSamples - 0.5
+				jLo := int(uLo)
+				if float64(jLo) < uLo {
+					jLo++
+				}
+				uHi := right*rasterSubSamples - 0.5
+				jHi := int(uHi)
+				if float64(jHi) < uHi {
+					jHi++
+				}
+				if jLo < 0 {
+					jLo = 0
+				}
+				if jHi > maxSubX {
+					jHi = maxSubX
+				}
+				if jHi <= jLo {
+					continue
+				}
+
+				px0 := jLo >> 3
+				px1 := jHi >> 3
+				if px0 == px1 {
+					counts[px0] += uint8(jHi - jLo)
+					continue
+				}
+				counts[px0] += uint8(rasterSubSamples - (jLo & 7))
+				for px := px0 + 1; px < px1; px++ {
+					counts[px] += rasterSubSamples
+				}
+				if rem1 := jHi & 7; rem1 != 0 {
+					counts[px1] += uint8(rem1)
 				}
 			}
 		}
 
-		rowOff := py * width
+		dstRow := dst[(py+offY)*stride+offX : (py+offY)*stride+offX+width]
 		for px, c := range counts {
-			if c > 0 {
-				cov := float64(c) / float64(sub*sub)
-				alpha[rowOff+px] = uint8(math.Round(cov * 255.0))
+			if c != 0 {
+				dstRow[px] = lut[c]
 			}
 		}
 	}
 
-	return &LogoMask{
-		Width:  width,
-		Height: height,
-		Alpha:  alpha,
-	}
+	sc.edges = edges[:0]
+	sc.edgeNext = edgeNext[:0]
+	sc.active = active[:0]
+	sc.xs = xs[:0]
+	scratchPool.Put(sc)
 }
 
-// TintRGBA produces a non-premultiplied RGBA image (for PNG / Kitty f=100 or f=32) colored with col.
+// TintRGBA produces a non-premultiplied RGBA image colored with col.
 func (m *LogoMask) TintRGBA(col color.RGBA) *image.NRGBA {
 	return m.TintPaddedRGBA(col, m.Width, m.Height, 0, 0)
 }

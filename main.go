@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"image"
@@ -10,11 +11,13 @@ import (
 	"math"
 	"os"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 )
 
-const defaultVersion = "v0.4.0"
+const defaultVersion = "v0.5.0"
 
 var version = ""
 
@@ -215,7 +218,7 @@ func runScreensaver(cfg Config) error {
 	lastTick := startTime
 	var hasMousePos bool
 	var lastMouseCol, lastMouseRow int
-	var cachedETA string
+	var hudState hudBuilder
 	var lastETACalc time.Time
 
 	usableRowsFor := func(rows int) int {
@@ -242,10 +245,10 @@ func runScreensaver(cfg Config) error {
 		var hud string
 		if showStats {
 			if now.Sub(lastETACalc) > 250*time.Millisecond {
-				cachedETA = formatNextCornerETA(phys)
+				hudState.RefreshETA(phys)
 				lastETACalc = now
 			}
-			hud = buildHUD(phys, mode, cfg.SpeedMult, paused, cachedETA)
+			hud = hudState.Build(phys, mode, cfg.SpeedMult, paused)
 		}
 
 		colorIdx, flash := phys.ActiveDisplayColor()
@@ -334,7 +337,6 @@ func runScreensaver(cfg Config) error {
 				metrics = QueryMetrics(int(ttyOut.Fd()), csiCellW, csiCellH)
 			}
 			if mode == ModeKitty {
-				// Keep existing cached textures bouncing inside updated bounds during drag; re-upload once settled.
 				newMaxX, newMaxY := arenaBounds()
 				phys.UpdateBounds(newMaxX, newMaxY)
 				phys.SetSpeed(computePixelSpeed(metrics, cfg.SpeedMult))
@@ -475,7 +477,6 @@ func runScreensaver(cfg Config) error {
 			lastTick = now
 
 			if !paused {
-				// Filter wakeup phase jitter during steady-state ticks while preserving exact speed on real hitches.
 				stepDT := rawDT
 				if rawDT >= 0.4*targetDT && rawDT <= 2.2*targetDT {
 					smoothedDT += (rawDT - smoothedDT) * 0.08
@@ -535,7 +536,6 @@ func computeArenaAndUpload(
 	if mode == ModeKitty {
 		logoPxW = int(math.Round(float64(gridW) * scale))
 		logoPxH = int(math.Round(float64(logoPxW) / aspect))
-		// Clamp so logo never exceeds 45% of screen height on very short wide splits.
 		maxAllowedH := int(float64(gridH) * 0.45)
 		if maxAllowedH >= 12 && logoPxH > maxAllowedH {
 			logoPxH = maxAllowedH
@@ -555,7 +555,6 @@ func computeArenaAndUpload(
 		return logoPxW, logoPxH, maxX, maxY
 	}
 
-	// ANSI / ASCII cell-aligned bounds mapped onto virtual pixel coordinates.
 	colsW := int(math.Round(float64(m.Cols) * scale))
 	if colsW < 14 {
 		colsW = min(max(4, m.Cols-2), 14)
@@ -574,37 +573,114 @@ func computeArenaAndUpload(
 
 func computePixelSpeed(m TermMetrics, mult float64) float64 {
 	diag := math.Hypot(float64(m.GridPxW()), float64(m.GridPxH()))
-	// ~0.185 * viewport diagonal per second crosses a standard 16:10 window in ~5.5 seconds.
 	return diag * 0.185 * mult
 }
 
-func formatNextCornerETA(p *Physics) string {
-	secs, cname, ok := p.PredictNextCorner(6000)
-	if !ok {
-		return "next corner: >30m (press 'c' to nudge)"
-	}
-	if secs < 60 {
-		return fmt.Sprintf("next corner: %.1fs (%s)", secs, cname)
-	}
-	totalSec := int(math.Round(secs))
-	mins := totalSec / 60
-	rem := totalSec % 60
-	return fmt.Sprintf("next corner: %dm%02ds (%s)", mins, rem, cname)
+// hudBuilder formats the status bar into double-buffered inline storage so even at 240 FPS
+// with -stats active, HUD updates incur 0 heap allocations and never alias renderer prevHUD state.
+type hudBuilder struct {
+	bufs      [2][384]byte
+	etaBuf    [80]byte
+	etaLen    int
+	cur       int
+	hasCached bool
+	bounces   int
+	corners   int
+	mode      RenderMode
+	speedX10  int
+	paused    bool
+	lastNote  string
+	cached    string
 }
 
-func buildHUD(p *Physics, mode RenderMode, speedMult float64, paused bool, eta string) string {
-	parts := make([]string, 0, 6)
-	parts = append(parts, fmt.Sprintf("bounces: %d", p.Bounces))
-	parts = append(parts, fmt.Sprintf("corners: %d", p.Corners))
-	parts = append(parts, eta)
-	parts = append(parts, fmt.Sprintf("mode: %s (%.1fx)", mode.String(), speedMult))
+func appendNextCornerETA(dst []byte, p *Physics) []byte {
+	secs, cname, ok := p.PredictNextCorner(6000)
+	if !ok {
+		return append(dst, "next corner: >30m (press 'c' to nudge)"...)
+	}
+	dst = append(dst, "next corner: "...)
+	if secs < 60 {
+		dst = strconv.AppendFloat(dst, secs, 'f', 1, 64)
+		dst = append(dst, "s ("...)
+	} else {
+		totalSec := int(math.Round(secs))
+		mins := totalSec / 60
+		rem := totalSec % 60
+		dst = strconv.AppendInt(dst, int64(mins), 10)
+		dst = append(dst, 'm')
+		if rem < 10 {
+			dst = append(dst, '0')
+		}
+		dst = strconv.AppendInt(dst, int64(rem), 10)
+		dst = append(dst, "s ("...)
+	}
+	dst = append(dst, cname...)
+	return append(dst, ')')
+}
+
+func formatNextCornerETA(p *Physics) string {
+	var tmp [80]byte
+	return string(appendNextCornerETA(tmp[:0], p))
+}
+
+func (h *hudBuilder) RefreshETA(p *Physics) {
+	var tmp [80]byte
+	next := appendNextCornerETA(tmp[:0], p)
+	if !bytes.Equal(h.etaBuf[:h.etaLen], next) {
+		h.etaLen = copy(h.etaBuf[:], next)
+		h.hasCached = false
+	}
+}
+
+func (h *hudBuilder) Build(p *Physics, mode RenderMode, speedMult float64, paused bool) string {
+	if h.etaLen == 0 {
+		h.RefreshETA(p)
+	}
+	speedX10 := int(math.Round(speedMult * 10.0))
+	if h.hasCached &&
+		h.bounces == p.Bounces &&
+		h.corners == p.Corners &&
+		h.mode == mode &&
+		h.speedX10 == speedX10 &&
+		h.paused == paused &&
+		h.lastNote == p.LastNote {
+		return h.cached
+	}
+
+	h.cur ^= 1
+	b := h.bufs[h.cur][:0]
+	b = append(b, "bounces: "...)
+	b = strconv.AppendInt(b, int64(p.Bounces), 10)
+	b = append(b, "  •  corners: "...)
+	b = strconv.AppendInt(b, int64(p.Corners), 10)
+	b = append(b, "  •  "...)
+	b = append(b, h.etaBuf[:h.etaLen]...)
+	b = append(b, "  •  mode: "...)
+	b = append(b, mode.String()...)
+	b = append(b, " ("...)
+	b = strconv.AppendInt(b, int64(speedX10/10), 10)
+	b = append(b, '.', byte('0'+speedX10%10), 'x', ')')
 	if paused {
-		parts = append(parts, "PAUSED")
+		b = append(b, "  •  PAUSED"...)
 	}
 	if p.LastNote != "" {
-		parts = append(parts, p.LastNote)
+		note := p.LastNote
+		if len(note) > 120 {
+			note = note[:120]
+		}
+		b = append(b, "  •  "...)
+		b = append(b, note...)
 	}
-	return strings.Join(parts, "  •  ")
+
+	h.bounces = p.Bounces
+	h.corners = p.Corners
+	h.mode = mode
+	h.speedX10 = speedX10
+	h.paused = paused
+	h.lastNote = p.LastNote
+	h.hasCached = true
+	h.cached = unsafe.String(&h.bufs[h.cur][0], len(b))
+	return h.cached
 }
 
 // writePreviewSheet renders a dark terminal showcase image featuring multiple palette-colored
@@ -612,7 +688,6 @@ func buildHUD(p *Physics, mode RenderMode, speedMult float64, paused bool, eta s
 func writePreviewSheet(outPath string, includeVideo bool) error {
 	const W, H = 960, 540
 	canvas := image.NewNRGBA(image.Rect(0, 0, W, H))
-	// Fill with sleek Ghostty dark background (#14161B).
 	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{color.RGBA{0x14, 0x16, 0x1B, 0xFF}}, image.Point{}, draw.Src)
 
 	aspect := LogoAspectRatio(includeVideo)

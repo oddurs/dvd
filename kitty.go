@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/png"
@@ -41,13 +43,19 @@ func (p *pngBufPool) Put(b *png.EncoderBuffer) {
 	p.mu.Unlock()
 }
 
+// templateIndexedPalette initializes a 65-entry non-premultiplied palette (0..64 subpixel coverage)
+// so a single 1-byte/pixel PNG encode can be re-tinted for every palette color in nanoseconds by
+// patching only the 195-byte PLTE chunk + IEEE CRC32.
+var templateIndexedPalette = func() color.Palette {
+	pal := make(color.Palette, rasterMaxCoverage+1)
+	for k := 0; k <= rasterMaxCoverage; k++ {
+		pal[k] = color.NRGBA{R: 0xFF, G: 0xFF, B: 0xFF, A: covToAlpha[k]}
+	}
+	return pal
+}()
+
 // KittyRenderer manages GPU-cached supersampled logo textures and sub-pixel smooth placements
 // using the Kitty Graphics Protocol (directly or wrapped in tmux DCS passthrough).
-//
-// Each texture is rasterized at 2x sub-pixel density inside a padded transparent margin and
-// displayed into a FIXED (c x r) cell box via source-rectangle cropping (x, y, w, h).
-// That keeps the rendered cell box 100% constant (zero jelly stretching) while sliding smoothly
-// in half-pixel GPU bilinear increments across cell boundaries.
 type KittyRenderer struct {
 	out             io.Writer
 	blackBG         bool
@@ -71,7 +79,11 @@ type KittyRenderer struct {
 	prevW, prevH    int
 	prevC, prevR    int
 	prevHUD         string
-	buf             bytes.Buffer
+	outBuf          []byte
+	pngBuf          bytes.Buffer
+	idxPix          []uint8
+	b64Buf          []byte
+	palImg          image.Paletted
 	pngPool         pngBufPool
 }
 
@@ -81,23 +93,22 @@ func NewKittyRenderer(out io.Writer, blackBG, tmuxPassthrough bool) *KittyRender
 		blackBG:         blackBG,
 		tmuxPassthrough: tmuxPassthrough,
 		nextBaseID:      100,
+		outBuf:          make([]byte, 0, 256),
 	}
 }
 
-func (k *KittyRenderer) writeAPCStart() {
+func (k *KittyRenderer) appendAPCStart(b []byte) []byte {
 	if k.tmuxPassthrough {
-		k.buf.WriteString("\x1bPtmux;\x1b\x1b_G")
-	} else {
-		k.buf.WriteString("\x1b_G")
+		return append(b, "\x1bPtmux;\x1b\x1b_G"...)
 	}
+	return append(b, "\x1b_G"...)
 }
 
-func (k *KittyRenderer) writeAPCEnd() {
+func (k *KittyRenderer) appendAPCEnd(b []byte) []byte {
 	if k.tmuxPassthrough {
-		k.buf.WriteString("\x1b\x1b\\\x1b\\")
-	} else {
-		k.buf.WriteString("\x1b\\")
+		return append(b, "\x1b\x1b\\\x1b\\"...)
 	}
+	return append(b, "\x1b\\"...)
 }
 
 func (k *KittyRenderer) resetSGR() string {
@@ -107,9 +118,43 @@ func (k *KittyRenderer) resetSGR() string {
 	return "\x1b[0m"
 }
 
-// UploadPalette rasterizes the vector DVD logo at 2x supersampled texel density inside a padded
-// transparent atlas aligned to (cellW, cellH), encodes all palette PNGs in parallel, and uploads
-// them to terminal GPU memory.
+// findPLTEChunk locates the PLTE chunk's 4-byte type header and RGB payload slice inside a valid PNG stream.
+func findPLTEChunk(pngBytes []byte) (typeStart, dataStart, dataEnd int, ok bool) {
+	if len(pngBytes) < 33 {
+		return 0, 0, 0, false
+	}
+	pos := 8 // skip 8-byte PNG magic header
+	for pos+12 <= len(pngBytes) {
+		length := int(binary.BigEndian.Uint32(pngBytes[pos : pos+4]))
+		if length < 0 || pos+12+length > len(pngBytes) {
+			return 0, 0, 0, false
+		}
+		if pngBytes[pos+4] == 'P' && pngBytes[pos+5] == 'L' && pngBytes[pos+6] == 'T' && pngBytes[pos+7] == 'E' {
+			if length > 0 && length%3 == 0 {
+				return pos + 4, pos + 8, pos + 8 + length, true
+			}
+			return 0, 0, 0, false
+		}
+		pos += 12 + length
+	}
+	return 0, 0, 0, false
+}
+
+// patchPLTEColor updates all RGB entries in the PLTE chunk and recomputes its 4-byte IEEE CRC32.
+func patchPLTEColor(pngBytes []byte, typeStart, dataStart, dataEnd int, col color.RGBA) {
+	plte := pngBytes[dataStart:dataEnd]
+	for i := 0; i+2 < len(plte); i += 3 {
+		plte[i+0] = col.R
+		plte[i+1] = col.G
+		plte[i+2] = col.B
+	}
+	crc := crc32.ChecksumIEEE(pngBytes[typeStart:dataEnd])
+	binary.BigEndian.PutUint32(pngBytes[dataEnd:dataEnd+4], crc)
+}
+
+// UploadPalette rasterizes the vector DVD logo at 2x supersampled texel density, encodes a single
+// 1-byte/pixel indexed PNG, patches PLTE+CRC32 for each palette color in-place, and uploads all
+// textures to terminal GPU memory.
 func (k *KittyRenderer) UploadPalette(
 	logoW, logoH, cellW, cellH, termCols, termRows int,
 	includeVideo bool,
@@ -157,55 +202,85 @@ func (k *KittyRenderer) UploadPalette(
 	texW := marginX + cropW
 	texH := marginY + cropH
 
-	mask := RasterizeDVDMask(sLogoW, sLogoH, includeVideo)
+	needPix := texW * texH
+	if cap(k.idxPix) < needPix {
+		k.idxPix = make([]uint8, needPix)
+	} else {
+		k.idxPix = k.idxPix[:needPix]
+		clear(k.idxPix)
+	}
+	rasterizeDVDInto(k.idxPix, texW, marginX, marginY, sLogoW, sLogoH, includeVideo, &identityCovLUT)
+
+	k.palImg = image.Paletted{
+		Pix:     k.idxPix,
+		Stride:  texW,
+		Rect:    image.Rect(0, 0, texW, texH),
+		Palette: templateIndexedPalette,
+	}
+
+	k.pngBuf.Reset()
+	enc := png.Encoder{
+		CompressionLevel: png.BestSpeed,
+		BufferPool:       &k.pngPool,
+	}
+	if err := enc.Encode(&k.pngBuf, &k.palImg); err != nil {
+		return err
+	}
+	pngBytes := k.pngBuf.Bytes()
+	typeStart, dataStart, dataEnd, hasPLTE := findPLTEChunk(pngBytes)
+
+	encLen := base64.StdEncoding.EncodedLen(len(pngBytes))
+	if cap(k.b64Buf) < encLen {
+		k.b64Buf = make([]byte, encLen)
+	} else {
+		k.b64Buf = k.b64Buf[:encLen]
+	}
+
 	base := k.nextBaseID
 	k.nextBaseID += uint32(len(palette) + 8)
 
-	total := len(palette) + 1
-	b64Payloads := make([][]byte, total)
-	errs := make([]error, total)
+	b := append(k.outBuf[:0], "\x1b[?2026h"...)
+	b = k.appendAPCStart(b)
+	b = append(b, "a=d,d=A,q=2"...)
+	b = k.appendAPCEnd(b)
 
-	var wg sync.WaitGroup
-	wg.Add(total)
-	for i := 0; i < total; i++ {
-		col := flash
-		if i < len(palette) {
-			col = palette[i]
+	var fallbackMask *LogoMask
+	emitColor := func(id uint32, col color.RGBA) error {
+		if hasPLTE && col.A == 0xFF {
+			patchPLTEColor(pngBytes, typeStart, dataStart, dataEnd, col)
+			base64.StdEncoding.Encode(k.b64Buf, pngBytes)
+			b = k.appendBase64Chunks(b, id, k.b64Buf)
+			return nil
 		}
-		go func(idx int, c color.RGBA) {
-			defer wg.Done()
-			img := mask.TintPaddedRGBA(c, texW, texH, marginX, marginY)
-			b64, err := k.encodePNGToBase64(img)
-			b64Payloads[idx] = b64
-			errs[idx] = err
-		}(i, col)
+		if fallbackMask == nil {
+			fallbackMask = RasterizeDVDMask(sLogoW, sLogoH, includeVideo)
+		}
+		var fbBuf bytes.Buffer
+		if err := enc.Encode(&fbBuf, fallbackMask.TintPaddedRGBA(col, texW, texH, marginX, marginY)); err != nil {
+			return err
+		}
+		b64 := make([]byte, base64.StdEncoding.EncodedLen(fbBuf.Len()))
+		base64.StdEncoding.Encode(b64, fbBuf.Bytes())
+		b = k.appendBase64Chunks(b, id, b64)
+		return nil
 	}
-	wg.Wait()
-
-	k.buf.Reset()
-	k.buf.WriteString("\x1b[?2026h")
-	// Delete any previous images and free terminal GPU/RAM cache.
-	k.writeAPCStart()
-	k.buf.WriteString("a=d,d=A,q=2")
-	k.writeAPCEnd()
 
 	k.colorIDs = k.colorIDs[:0]
-	for i := 0; i < len(palette); i++ {
-		if errs[i] != nil {
-			return errs[i]
-		}
+	for i, col := range palette {
 		id := base + uint32(i)
-		k.writeBase64Chunks(id, b64Payloads[i])
+		if err := emitColor(id, col); err != nil {
+			return err
+		}
 		k.colorIDs = append(k.colorIDs, id)
 	}
 
-	if errs[len(palette)] != nil {
-		return errs[len(palette)]
-	}
 	k.flashID = base + uint32(len(palette))
-	k.writeBase64Chunks(k.flashID, b64Payloads[len(palette)])
+	if err := emitColor(k.flashID, flash); err != nil {
+		return err
+	}
 
-	k.buf.WriteString("\x1b[?2026l")
+	b = append(b, "\x1b[?2026l"...)
+	k.outBuf = b
 	k.activeImgID = 0
 	k.hasPrev = false
 	k.prevHUD = ""
@@ -220,7 +295,7 @@ func (k *KittyRenderer) UploadPalette(
 	k.marginX = marginX
 	k.marginY = marginY
 
-	_, err := k.out.Write(k.buf.Bytes())
+	_, err := k.out.Write(b)
 	return err
 }
 
@@ -278,56 +353,67 @@ func (k *KittyRenderer) DrawFrame(fx, fy float64, cols, rows int, colorIdx int, 
 		return nil
 	}
 
-	k.buf.Reset()
-	k.buf.WriteString("\x1b[?2026h")
+	b := append(k.outBuf[:0], "\x1b[?2026h"...)
 
 	if k.activeImgID != 0 && k.activeImgID != targetID {
 		// Delete only the visible placement (d=i lowercase keeps cached image texture in RAM).
-		k.writeAPCStart()
-		k.buf.WriteString("a=d,d=i,i=")
-		writeUint(&k.buf, uint64(k.activeImgID))
-		k.buf.WriteString(",p=1,q=2")
-		k.writeAPCEnd()
+		if k.tmuxPassthrough {
+			b = append(b, "\x1bPtmux;\x1b\x1b_Ga=d,d=i,i="...)
+		} else {
+			b = append(b, "\x1b_Ga=d,d=i,i="...)
+		}
+		b = strconv.AppendUint(b, uint64(k.activeImgID), 10)
+		if k.tmuxPassthrough {
+			b = append(b, ",p=1,q=2\x1b\x1b\\\x1b\\"...)
+		} else {
+			b = append(b, ",p=1,q=2\x1b\\"...)
+		}
 	}
 
 	// Anchor cell (1-indexed) + fixed c/r cell span + source rectangle crop (x,y,w,h) behind text (z=-1).
-	k.buf.WriteString("\x1b[")
-	writeUint(&k.buf, uint64(row0+1))
-	k.buf.WriteByte(';')
-	writeUint(&k.buf, uint64(col0+1))
-	k.buf.WriteByte('H')
+	b = append(b, "\x1b["...)
+	b = strconv.AppendUint(b, uint64(row0+1), 10)
+	b = append(b, ';')
+	b = strconv.AppendUint(b, uint64(col0+1), 10)
+	b = append(b, 'H')
 
-	k.writeAPCStart()
-	k.buf.WriteString("a=p,i=")
-	writeUint(&k.buf, uint64(targetID))
-	k.buf.WriteString(",p=")
-	writeUint(&k.buf, kittyPlacementID)
-	k.buf.WriteString(",x=")
-	writeUint(&k.buf, uint64(srcX))
-	k.buf.WriteString(",y=")
-	writeUint(&k.buf, uint64(srcY))
-	k.buf.WriteString(",w=")
-	writeUint(&k.buf, uint64(w))
-	k.buf.WriteString(",h=")
-	writeUint(&k.buf, uint64(h))
-	k.buf.WriteString(",c=")
-	writeUint(&k.buf, uint64(c))
-	k.buf.WriteString(",r=")
-	writeUint(&k.buf, uint64(r))
-	k.buf.WriteString(",z=-1,C=1,q=2")
-	k.writeAPCEnd()
-
-	if hud != "" {
-		k.buf.WriteString("\x1b[")
-		writeUint(&k.buf, uint64(rows))
-		k.buf.WriteString(";1H")
-		k.buf.WriteString(k.resetSGR())
-		k.buf.WriteString("\x1b[2K\x1b[38;5;242m ")
-		k.buf.WriteString(hud)
-		k.buf.WriteString(k.resetSGR())
+	if k.tmuxPassthrough {
+		b = append(b, "\x1bPtmux;\x1b\x1b_Ga=p,i="...)
+	} else {
+		b = append(b, "\x1b_Ga=p,i="...)
+	}
+	b = strconv.AppendUint(b, uint64(targetID), 10)
+	b = append(b, ",p=1,x="...)
+	b = strconv.AppendUint(b, uint64(srcX), 10)
+	b = append(b, ",y="...)
+	b = strconv.AppendUint(b, uint64(srcY), 10)
+	b = append(b, ",w="...)
+	b = strconv.AppendUint(b, uint64(w), 10)
+	b = append(b, ",h="...)
+	b = strconv.AppendUint(b, uint64(h), 10)
+	b = append(b, ",c="...)
+	b = strconv.AppendUint(b, uint64(c), 10)
+	b = append(b, ",r="...)
+	b = strconv.AppendUint(b, uint64(r), 10)
+	if k.tmuxPassthrough {
+		b = append(b, ",z=-1,C=1,q=2\x1b\x1b\\\x1b\\"...)
+	} else {
+		b = append(b, ",z=-1,C=1,q=2\x1b\\"...)
 	}
 
-	k.buf.WriteString("\x1b[?2026l")
+	if hud != "" {
+		rst := k.resetSGR()
+		b = append(b, "\x1b["...)
+		b = strconv.AppendUint(b, uint64(rows), 10)
+		b = append(b, ";1H"...)
+		b = append(b, rst...)
+		b = append(b, "\x1b[2K\x1b[38;5;242m "...)
+		b = append(b, hud...)
+		b = append(b, rst...)
+	}
+
+	b = append(b, "\x1b[?2026l"...)
+	k.outBuf = b
 	k.activeImgID = targetID
 	k.hasPrev = true
 	k.prevCol0 = col0
@@ -340,7 +426,7 @@ func (k *KittyRenderer) DrawFrame(fx, fy float64, cols, rows int, colorIdx int, 
 	k.prevR = r
 	k.prevHUD = hud
 
-	_, err := k.out.Write(k.buf.Bytes())
+	_, err := k.out.Write(b)
 	return err
 }
 
@@ -348,13 +434,13 @@ func (k *KittyRenderer) DrawFrame(fx, fy float64, cols, rows int, colorIdx int, 
 func (k *KittyRenderer) ClearHUDLine(rows int) {
 	k.prevHUD = ""
 	if rows >= 1 {
-		k.buf.Reset()
-		k.buf.WriteString("\x1b[?2026h\x1b[")
-		writeUint(&k.buf, uint64(rows))
-		k.buf.WriteString(";1H")
-		k.buf.WriteString(k.resetSGR())
-		k.buf.WriteString("\x1b[2K\x1b[?2026l")
-		_, _ = k.out.Write(k.buf.Bytes())
+		b := append(k.outBuf[:0], "\x1b[?2026h\x1b["...)
+		b = strconv.AppendUint(b, uint64(rows), 10)
+		b = append(b, ";1H"...)
+		b = append(b, k.resetSGR()...)
+		b = append(b, "\x1b[2K\x1b[?2026l"...)
+		k.outBuf = b
+		_, _ = k.out.Write(b)
 	}
 }
 
@@ -370,21 +456,7 @@ func (k *KittyRenderer) ClearAll() {
 	k.prevHUD = ""
 }
 
-func (k *KittyRenderer) encodePNGToBase64(img image.Image) ([]byte, error) {
-	var pngBuf bytes.Buffer
-	enc := png.Encoder{
-		CompressionLevel: png.BestSpeed,
-		BufferPool:       &k.pngPool,
-	}
-	if err := enc.Encode(&pngBuf, img); err != nil {
-		return nil, err
-	}
-	b64 := make([]byte, base64.StdEncoding.EncodedLen(pngBuf.Len()))
-	base64.StdEncoding.Encode(b64, pngBuf.Bytes())
-	return b64, nil
-}
-
-func (k *KittyRenderer) writeBase64Chunks(id uint32, b64 []byte) {
+func (k *KittyRenderer) appendBase64Chunks(b []byte, id uint32, b64 []byte) []byte {
 	chunkSize := 4096
 	if k.tmuxPassthrough {
 		// Keep DCS passthrough packets compact (~1KB) for all tmux versions.
@@ -392,28 +464,23 @@ func (k *KittyRenderer) writeBase64Chunks(id uint32, b64 []byte) {
 	}
 	for offset := 0; offset < len(b64); offset += chunkSize {
 		end := offset + chunkSize
-		more := uint64(1)
+		more := byte('1')
 		if end >= len(b64) {
 			end = len(b64)
-			more = 0
+			more = '0'
 		}
-		k.writeAPCStart()
+		b = k.appendAPCStart(b)
 		if offset == 0 {
-			k.buf.WriteString("a=t,f=100,i=")
-			writeUint(&k.buf, uint64(id))
-			k.buf.WriteString(",q=2,m=")
-			writeUint(&k.buf, more)
+			b = append(b, "a=t,f=100,i="...)
+			b = strconv.AppendUint(b, uint64(id), 10)
+			b = append(b, ",q=2,m="...)
+			b = append(b, more)
 		} else {
-			k.buf.WriteString("m=")
-			writeUint(&k.buf, more)
+			b = append(b, 'm', '=', more)
 		}
-		k.buf.WriteByte(';')
-		k.buf.Write(b64[offset:end])
-		k.writeAPCEnd()
+		b = append(b, ';')
+		b = append(b, b64[offset:end]...)
+		b = k.appendAPCEnd(b)
 	}
-}
-
-func writeUint(dst *bytes.Buffer, v uint64) {
-	var tmp [20]byte
-	dst.Write(strconv.AppendUint(tmp[:0], v, 10))
+	return b
 }

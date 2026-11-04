@@ -1,9 +1,9 @@
 package main
 
 import (
-	"fmt"
 	"math"
 	"math/rand"
+	"strconv"
 	"time"
 )
 
@@ -151,7 +151,7 @@ func (p *Physics) Step(dt float64) BounceEvent {
 		} else if ny >= p.MaxY-p.CornerTol && p.VY > 0 {
 			hitBottom = true
 			hitY = true
-			ny = p.MaxY
+			ny = 1 * p.MaxY
 		}
 	} else if hitY && !hitX {
 		if nx <= p.CornerTol && p.VX < 0 {
@@ -210,7 +210,7 @@ func (p *Physics) Step(dt float64) BounceEvent {
 		p.Corners++
 		p.nextColor()
 		p.CelebrateRemaining = 1.35
-		p.LastNote = fmt.Sprintf("CORNER HIT! (%s)", ev.CornerName)
+		p.LastNote = "CORNER HIT! (" + ev.CornerName + ")"
 		p.NoteRemaining = 3.5
 		return ev
 	}
@@ -245,7 +245,7 @@ func (p *Physics) Step(dt float64) BounceEvent {
 			ev.NearMiss = true
 			ev.NearMissPx = int(math.Max(1, math.Round(missDist)))
 			ev.CornerName = cname
-			p.LastNote = fmt.Sprintf("So close! Missed %s by %dpx", cname, ev.NearMissPx)
+			p.LastNote = "So close! Missed " + cname + " by " + strconv.Itoa(ev.NearMissPx) + "px"
 			p.NoteRemaining = 2.5
 		}
 	}
@@ -263,7 +263,6 @@ func (p *Physics) nextColor() {
 }
 
 // ActiveDisplayColor returns the current color index and whether the white flash frame is active.
-// During a corner celebration, the logo shimmers rapidly through the palette with bright flashes.
 func (p *Physics) ActiveDisplayColor() (colorIdx int, flash bool) {
 	if p.CelebrateRemaining <= 0 {
 		return p.ColorIdx, false
@@ -306,8 +305,6 @@ func (p *Physics) AimForCorner() {
 	bestDiff := 1e9
 	bestDX, bestDY := dX0+p.MaxX, dY0
 
-	// Search unfolded forward corners (0..2 wall bounces ahead) and choose the one
-	// requiring the smallest angular tweak while keeping a natural diagonal slope.
 	for kx := 0; kx <= 2; kx++ {
 		for ky := 0; ky <= 2; ky++ {
 			dx := dX0 + float64(kx)*p.MaxX
@@ -316,7 +313,6 @@ func (p *Physics) AimForCorner() {
 				continue
 			}
 			ang := math.Atan2(dy, dx)
-			// Keep angle comfortably diagonal (~22°..68°) so it still looks like a classic DVD bounce.
 			if ang < 0.38 || ang > 1.19 {
 				continue
 			}
@@ -339,11 +335,11 @@ func (p *Physics) AimForCorner() {
 }
 
 // PredictNextCorner scans forward in unfolded billiard space up to maxBounces X-wall hits
-// to find when (in seconds) and which corner will be hit next. Returns (seconds, cornerName, found).
+// using incremental modular stepping (zero math.Mod calls inside the loop).
 func (p *Physics) PredictNextCorner(maxBounces int) (float64, string, bool) {
 	vxAbs := math.Abs(p.VX)
 	vyAbs := math.Abs(p.VY)
-	if vxAbs < 1e-6 || vyAbs < 1e-6 || p.MaxX < 1 || p.MaxY < 1 {
+	if vxAbs < 1e-6 || vyAbs < 1e-6 || p.MaxX < 1 || p.MaxY < 1 || maxBounces <= 0 {
 		return 0, "", false
 	}
 
@@ -355,19 +351,44 @@ func (p *Physics) PredictNextCorner(maxBounces int) (float64, string, bool) {
 		tFirstX = p.X / vxAbs
 	}
 	periodX := p.MaxX / vxAbs
+	periodY := 2.0 * p.MaxY
+
+	m := math.Mod(p.Y+p.VY*tFirstX, periodY)
+	if m < 0 {
+		m += periodY
+	}
+	stepMod := math.Mod(p.VY*periodX, periodY)
+	if stepMod < 0 {
+		stepMod += periodY
+	}
+
+	tol := p.CornerTol
+	maxYMinusTol := p.MaxY - tol
 
 	for k := 0; k < maxBounces; k++ {
 		tx := tFirstX + float64(k)*periodX
+		var yAt, vyAt float64
+		if m < p.MaxY {
+			yAt = m
+			vyAt = p.VY
+		} else {
+			yAt = periodY - m
+			vyAt = -p.VY
+		}
+		m += stepMod
+		if m >= periodY {
+			m -= periodY
+		}
+
 		if tx <= 1e-4 {
 			continue
 		}
-		isLeft := firstRight && (k%2 == 1) || (!firstRight && (k%2 == 0))
-		yAt, vyAt := reflect1D(p.Y, p.VY, p.MaxY, tx)
+		isLeft := firstRight && (k&1 == 1) || (!firstRight && (k&1 == 0))
 
-		if yAt <= p.CornerTol && vyAt <= 0 {
+		if yAt <= tol && vyAt <= 0 {
 			return tx, cornerLabel(isLeft, true), true
 		}
-		if yAt >= p.MaxY-p.CornerTol && vyAt >= 0 {
+		if yAt >= maxYMinusTol && vyAt >= 0 {
 			return tx, cornerLabel(isLeft, false), true
 		}
 
@@ -380,7 +401,7 @@ func (p *Physics) PredictNextCorner(maxBounces int) (float64, string, bool) {
 			dtSinceY = (p.MaxY - yAt) / vyAbs
 			hitTop = false
 		}
-		if dtSinceY >= 0 && dtSinceY*vxAbs <= p.CornerTol && tx-dtSinceY > 1e-4 {
+		if dtSinceY >= 0 && dtSinceY*vxAbs <= tol && tx-dtSinceY > 1e-4 {
 			return tx - dtSinceY, cornerLabel(isLeft, hitTop), true
 		}
 	}

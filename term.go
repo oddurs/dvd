@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -45,8 +44,7 @@ func QueryMetrics(ttyFD int, csiCellW, csiCellH int) TermMetrics {
 	}
 
 	// If logical 1x points were reported (e.g. 8x18 CSS/point metrics on a 2x Retina display),
-	// upsample sub-cell coordinates 2x while preserving the exact cell aspect ratio so textures
-	// stay Retina-sharp and motion has >=16 sub-steps per cell.
+	// upsample sub-cell coordinates 2x while preserving the exact cell aspect ratio.
 	if cellW > 0 && cellW < 12 {
 		scale := (15 + cellW) / cellW // 2x for 8..11px
 		cellW *= scale
@@ -148,68 +146,81 @@ func hasDA1Response(b []byte) bool {
 	}
 }
 
+var (
+	csi16tPrefix = []byte("\x1b[6;")
+	csi14tPrefix = []byte("\x1b[4;")
+	stTermBytes  = []byte("\x1b\\")
+)
+
 // parseCSI16t extracts (cellW, cellH) from "\x1b[6;<height>;<width>t".
 func parseCSI16t(s string) (cellW, cellH int) {
-	return parseCSITwoParams(s, "\x1b[6;")
+	return parseCSITwoParamsBytes([]byte(s), csi16tPrefix)
 }
 
 // parseCSI14t extracts (winW, winH) from "\x1b[4;<height>;<width>t".
 func parseCSI14t(s string) (winW, winH int) {
-	return parseCSITwoParams(s, "\x1b[4;")
+	return parseCSITwoParamsBytes([]byte(s), csi14tPrefix)
 }
 
-func parseCSITwoParams(s, prefix string) (w, h int) {
-	rest := s
+func parseCSI16tBytes(b []byte) (cellW, cellH int) {
+	return parseCSITwoParamsBytes(b, csi16tPrefix)
+}
+
+func parseCSITwoParamsBytes(b, prefix []byte) (w, h int) {
+	rest := b
 	for {
-		idx := strings.Index(rest, prefix)
+		idx := bytes.Index(rest, prefix)
 		if idx < 0 {
 			return 0, 0
 		}
 		after := rest[idx+len(prefix):]
-		end := strings.IndexByte(after, 't')
+		end := bytes.IndexByte(after, 't')
 		if end < 0 {
 			return 0, 0
 		}
 		body := after[:end]
-		if pw, ph, ok := parseTwoDigitsSemi(body); ok {
+		if pw, ph, ok := parseTwoDigitsSemiBytes(body); ok {
 			return pw, ph
 		}
 		rest = after
 	}
 }
 
-func parseTwoDigitsSemi(body string) (w, h int, ok bool) {
-	semi := strings.IndexByte(body, ';')
+func parseTwoDigitsSemiBytes(body []byte) (w, h int, ok bool) {
+	semi := bytes.IndexByte(body, ';')
 	if semi <= 0 || semi >= len(body)-1 {
 		return 0, 0, false
 	}
-	a, b := body[:semi], body[semi+1:]
-	if !isAllDigits(a) || !isAllDigits(b) {
-		return 0, 0, false
-	}
-	ph, err1 := strconv.Atoi(a)
-	pw, err2 := strconv.Atoi(b)
-	if err1 != nil || err2 != nil || pw <= 0 || ph <= 0 || pw > 65535 || ph > 65535 {
+	ph, ok1 := parseUintBytes(body[:semi])
+	pw, ok2 := parseUintBytes(body[semi+1:])
+	if !ok1 || !ok2 || pw <= 0 || ph <= 0 || pw > 65535 || ph > 65535 {
 		return 0, 0, false
 	}
 	return pw, ph, true
 }
 
-func isAllDigits(s string) bool {
-	if len(s) == 0 || len(s) > 6 {
-		return false
+func parseUintBytes(b []byte) (int, bool) {
+	if len(b) == 0 || len(b) > 6 {
+		return 0, false
 	}
-	for i := 0; i < len(s); i++ {
-		if s[i] < '0' || s[i] > '9' {
-			return false
+	v := 0
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if c < '0' || c > '9' {
+			return 0, false
 		}
+		v = v*10 + int(c-'0')
 	}
-	return true
+	return v, true
 }
 
 // parseSGRMouse parses an SGR mouse sequence "\x1b[<Cb;Cx;CyM" or "\x1b[<Cb;Cx;Cym".
 func parseSGRMouse(seq string) (ev InputEvent, ok bool) {
-	if len(seq) < 9 || !strings.HasPrefix(seq, "\x1b[<") {
+	return parseSGRMouseBytes([]byte(seq))
+}
+
+func parseSGRMouseBytes(seq []byte) (ev InputEvent, ok bool) {
+	if len(seq) < 9 || seq[0] != 0x1b || seq[1] != '[' || seq[2] != '<' {
 		return InputEvent{}, false
 	}
 	final := seq[len(seq)-1]
@@ -217,23 +228,19 @@ func parseSGRMouse(seq string) (ev InputEvent, ok bool) {
 		return InputEvent{}, false
 	}
 	body := seq[3 : len(seq)-1]
-	s1 := strings.IndexByte(body, ';')
+	s1 := bytes.IndexByte(body, ';')
 	if s1 <= 0 {
 		return InputEvent{}, false
 	}
 	rest := body[s1+1:]
-	s2 := strings.IndexByte(rest, ';')
+	s2 := bytes.IndexByte(rest, ';')
 	if s2 <= 0 || s2 >= len(rest)-1 {
 		return InputEvent{}, false
 	}
-	pBtn, pCol, pRow := body[:s1], rest[:s2], rest[s2+1:]
-	if !isAllDigits(pBtn) || !isAllDigits(pCol) || !isAllDigits(pRow) {
-		return InputEvent{}, false
-	}
-	btn, e1 := strconv.Atoi(pBtn)
-	col, e2 := strconv.Atoi(pCol)
-	row, e3 := strconv.Atoi(pRow)
-	if e1 != nil || e2 != nil || e3 != nil || col <= 0 || row <= 0 || col > 65535 || row > 65535 {
+	btn, ok1 := parseUintBytes(body[:s1])
+	col, ok2 := parseUintBytes(rest[:s2])
+	row, ok3 := parseUintBytes(rest[s2+1:])
+	if !ok1 || !ok2 || !ok3 || col <= 0 || row <= 0 || col > 65535 || row > 65535 {
 		return InputEvent{}, false
 	}
 	return InputEvent{
@@ -279,7 +286,7 @@ type InputEvent struct {
 }
 
 // InputParser reassembles raw terminal byte chunks across arbitrary Read() boundaries
-// without misinterpreting split CSI/APC replies as user Esc or keypresses.
+// with zero heap allocations on parsed CSI, arrow, UTF-8, and SGR mouse events.
 type InputParser struct {
 	buf []byte
 }
@@ -301,7 +308,6 @@ func (p *InputParser) FlushTimeout(events chan<- InputEvent) {
 			events <- InputEvent{Action: ActionQuit}
 			return
 		}
-		// Incomplete stale escape sequence: discard cleanly without spurious keypresses.
 		p.buf = p.buf[:0]
 		return
 	}
@@ -309,7 +315,7 @@ func (p *InputParser) FlushTimeout(events chan<- InputEvent) {
 	events <- InputEvent{Action: ActionAnyOtherKey}
 }
 
-// Feed appends raw bytes and emits all complete InputEvents.
+// Feed appends raw bytes and emits all complete InputEvents while preserving backing slice capacity.
 func (p *InputParser) Feed(data []byte, events chan<- InputEvent) {
 	if len(data) == 0 {
 		return
@@ -322,29 +328,40 @@ func (p *InputParser) Feed(data []byte, events chan<- InputEvent) {
 	}
 	p.buf = append(p.buf, data...)
 
-	for len(p.buf) > 0 {
-		b := p.buf[0]
+	buf := p.buf
+	pos := 0
+	defer func() {
+		if pos >= len(buf) {
+			p.buf = buf[:0]
+		} else if pos > 0 {
+			n := copy(buf, buf[pos:])
+			p.buf = buf[:n]
+		}
+	}()
+
+	for pos < len(buf) {
+		rem := buf[pos:]
+		b := rem[0]
 		if b == 0x1b {
-			if len(p.buf) == 1 {
-				// Wait briefly to see whether trailing escape sequence bytes follow.
+			if len(rem) == 1 {
 				return
 			}
-			next := p.buf[1]
+			next := rem[1]
 
 			// APC / DCS / OSC string sequences: \x1b_ , \x1bP , \x1b] ... \x1b\\ (or BEL \x07)
 			if next == '_' || next == 'P' || next == ']' {
-				stIdx := bytes.Index(p.buf[2:], []byte("\x1b\\"))
-				belIdx := bytes.IndexByte(p.buf[2:], 0x07)
+				stIdx := bytes.Index(rem[2:], stTermBytes)
+				belIdx := bytes.IndexByte(rem[2:], 0x07)
 				if stIdx >= 0 && (belIdx < 0 || stIdx < belIdx) {
-					p.buf = p.buf[2+stIdx+2:]
+					pos += 2 + stIdx + 2
 					continue
 				}
 				if belIdx >= 0 {
-					p.buf = p.buf[2+belIdx+1:]
+					pos += 2 + belIdx + 1
 					continue
 				}
-				if len(p.buf) > 1024 {
-					p.buf = p.buf[2:]
+				if len(rem) > 1024 {
+					pos += 2
 					continue
 				}
 				return
@@ -353,49 +370,54 @@ func (p *InputParser) Feed(data []byte, events chan<- InputEvent) {
 			// CSI sequence: \x1b[ <param/intermediate 0x20..0x3F>* <final 0x40..0x7E>
 			if next == '[' {
 				j := 2
-				for j < len(p.buf) && p.buf[j] >= 0x20 && p.buf[j] <= 0x3F {
+				for j < len(rem) && rem[j] >= 0x20 && rem[j] <= 0x3F {
 					j++
 				}
-				if j >= len(p.buf) {
-					if len(p.buf) > 256 {
-						p.buf = p.buf[2:]
+				if j >= len(rem) {
+					if len(rem) > 256 {
+						pos += 2
 						continue
 					}
 					return
 				}
-				final := p.buf[j]
+				final := rem[j]
 				if final < 0x40 || final > 0x7E {
-					// Interrupted/aborted CSI (e.g. another Esc byte): drop prefix up to j.
-					p.buf = p.buf[j:]
+					pos += j
 					continue
 				}
-				seq := string(p.buf[:j+1])
-				p.buf = p.buf[j+1:]
-				if cw, ch := parseCSI16t(seq); cw > 0 && ch > 0 {
-					events <- InputEvent{CellW: cw, CellH: ch}
+				rawSeq := rem[:j+1]
+				pos += j + 1
+				if len(rawSeq) == 3 {
+					switch final {
+					case 'A', 'C':
+						events <- InputEvent{Action: ActionSpeedUp}
+					case 'B', 'D':
+						events <- InputEvent{Action: ActionSpeedDown}
+					}
 					continue
 				}
-				if mev, ok := parseSGRMouse(seq); ok {
-					events <- mev
+				if final == 't' {
+					if cw, ch := parseCSI16tBytes(rawSeq); cw > 0 && ch > 0 {
+						events <- InputEvent{CellW: cw, CellH: ch}
+					}
 					continue
 				}
-				switch seq {
-				case "\x1b[A", "\x1b[C":
-					events <- InputEvent{Action: ActionSpeedUp}
-				case "\x1b[B", "\x1b[D":
-					events <- InputEvent{Action: ActionSpeedDown}
+				if final == 'M' || final == 'm' {
+					if mev, ok := parseSGRMouseBytes(rawSeq); ok {
+						events <- mev
+					}
+					continue
 				}
-				// All other CSI replies (DA1, 14t, focus \x1b[I/\x1b[O) are ignored cleanly.
 				continue
 			}
 
 			// SS3 sequence (application-mode arrow keys: \x1bOA .. \x1bOD).
 			if next == 'O' {
-				if len(p.buf) < 3 {
+				if len(rem) < 3 {
 					return
 				}
-				code := p.buf[2]
-				p.buf = p.buf[3:]
+				code := rem[2]
+				pos += 3
 				switch code {
 				case 'A', 'C':
 					events <- InputEvent{Action: ActionSpeedUp}
@@ -409,29 +431,29 @@ func (p *InputParser) Feed(data []byte, events chan<- InputEvent) {
 
 			// Consecutive Esc byte: first Esc was standalone quit.
 			if next == 0x1b {
-				p.buf = p.buf[1:]
+				pos++
 				events <- InputEvent{Action: ActionQuit}
 				continue
 			}
 
 			// Alt+<key> two-byte sequence.
-			p.buf = p.buf[2:]
+			pos += 2
 			events <- InputEvent{Action: ActionAnyOtherKey}
 			continue
 		}
 
 		// Multi-byte UTF-8 rune: wait if incomplete, then emit a single event per rune.
 		if b >= 0x80 {
-			if !utf8.FullRune(p.buf) && len(p.buf) < utf8.UTFMax {
+			if !utf8.FullRune(rem) && len(rem) < utf8.UTFMax {
 				return
 			}
-			_, size := utf8.DecodeRune(p.buf)
-			p.buf = p.buf[max(1, size):]
+			_, size := utf8.DecodeRune(rem)
+			pos += max(1, size)
 			events <- InputEvent{Action: ActionAnyOtherKey}
 			continue
 		}
 
-		p.buf = p.buf[1:]
+		pos++
 		switch b {
 		case 3, 4, 'q', 'Q': // Ctrl+C, Ctrl+D, q
 			events <- InputEvent{Action: ActionQuit}

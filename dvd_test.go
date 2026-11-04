@@ -125,10 +125,15 @@ func TestKittyRendererChunkingPNGValidityAndSubpixelPlacements(t *testing.T) {
 		t.Fatalf("expected UploadPalette to clear previous textures with d=A")
 	}
 
-	// Verify every APC payload chunk is <= 4096 bytes AND reassemble id=100 to verify 2x supersampled PNG dimensions.
+	// Verify every APC payload chunk is <= 4096 bytes AND reassemble id=100, id=101, id=102
+	// to prove single-encode PLTE+CRC32 patching produces valid, color-exact PNGs for every texture.
 	parts := strings.Split(uploadStream, "\x1b_G")
-	var img100B64 strings.Builder
-	collecting100 := false
+	imgB64 := map[string]*strings.Builder{
+		"100": {},
+		"101": {},
+		"102": {},
+	}
+	activeCollect := ""
 	for _, part := range parts[1:] {
 		end := strings.Index(part, "\x1b\\")
 		if end < 0 {
@@ -143,28 +148,51 @@ func TestKittyRendererChunkingPNGValidityAndSubpixelPlacements(t *testing.T) {
 		if len(payload) > 4096 {
 			t.Fatalf("APC base64 chunk exceeded 4096 bytes: %d", len(payload))
 		}
-		if strings.Contains(ctrl, "i=100,") {
-			collecting100 = true
+		for id := range imgB64 {
+			if strings.Contains(ctrl, "i="+id+",") {
+				activeCollect = id
+			}
 		}
-		if collecting100 {
-			img100B64.WriteString(payload)
+		if activeCollect != "" {
+			imgB64[activeCollect].WriteString(payload)
 			if strings.Contains(ctrl, "m=0") {
-				collecting100 = false
+				activeCollect = ""
 			}
 		}
 	}
 
-	pngBytes, err := base64.StdEncoding.DecodeString(img100B64.String())
-	if err != nil {
-		t.Fatalf("failed to base64-decode transmitted image 100: %v", err)
+	wantColors := map[string]color.RGBA{
+		"100": pal[0],
+		"101": pal[1],
+		"102": cornerFlashColor,
 	}
-	decoded, err := png.Decode(bytes.NewReader(pngBytes))
-	if err != nil {
-		t.Fatalf("transmitted image 100 is not a valid PNG: %v", err)
-	}
-	// At 2x subpixel scale: texW = marginX(20) + cropW(500) = 520; texH = marginY(50) + cropH(320) = 370.
-	if decoded.Bounds().Dx() != 520 || decoded.Bounds().Dy() != 370 {
-		t.Fatalf("expected 2x supersampled padded PNG dimensions 520x370, got %v", decoded.Bounds())
+	// At 2x subpixel scale: sLogoW=480, sLogoH=270, marginX=20, marginY=50 -> texW=520, texH=370.
+	discX := 20 + int(math.Round(480.0*(35.0/logoViewWidth)))
+	holeX := 20 + int(math.Round(480.0*(72.8/logoViewWidth)))
+	discY := 50 + int(math.Round(270.0*(61.5/logoViewHeightVideo)))
+	for id, wantCol := range wantColors {
+		pngBytes, err := base64.StdEncoding.DecodeString(imgB64[id].String())
+		if err != nil {
+			t.Fatalf("failed to base64-decode transmitted image %s: %v", id, err)
+		}
+		decoded, err := png.Decode(bytes.NewReader(pngBytes))
+		if err != nil {
+			t.Fatalf("transmitted image %s is not a valid PNG (PLTE/CRC mismatch?): %v", id, err)
+		}
+		if decoded.Bounds().Dx() != 520 || decoded.Bounds().Dy() != 370 {
+			t.Fatalf("image %s: expected 2x supersampled padded PNG dimensions 520x370, got %v", id, decoded.Bounds())
+		}
+		if r, g, b, a := decoded.At(0, 0).RGBA(); a != 0 || r != 0 || g != 0 || b != 0 {
+			t.Fatalf("image %s: expected transparent margin at (0,0), got RGBA=(%d,%d,%d,%d)", id, r, g, b, a)
+		}
+		if _, _, _, a := decoded.At(holeX, discY).RGBA(); a != 0 {
+			t.Fatalf("image %s: expected transparent disc hole at (%d,%d), got alpha=%d", id, holeX, discY, a)
+		}
+		got := color.NRGBAModel.Convert(decoded.At(discX, discY)).(color.NRGBA)
+		want := color.NRGBA{R: wantCol.R, G: wantCol.G, B: wantCol.B, A: 255}
+		if got != want {
+			t.Fatalf("image %s: expected solid disc color %+v at (%d,%d), got %+v", id, want, discX, discY, got)
+		}
 	}
 
 	// Frame 1: place color 0 (id=100) at pixel (27.0, 45.0).
@@ -352,6 +380,9 @@ func TestANSIRendererSubCellDifferentialEraseBlackBGAndNoColor(t *testing.T) {
 	if !strings.Contains(f1, "▀") && !strings.Contains(f1, "▄") {
 		t.Fatalf("expected half-block glyphs in ANSI frame")
 	}
+	if !strings.Contains(f1, "█") {
+		t.Fatalf("expected full-block SGR deduplication glyph in solid interior runs")
+	}
 	if !strings.Contains(f1, "\x1b[48;2;0;0;0m") {
 		t.Fatalf("expected pitch-black background SGR when blackBG=true")
 	}
@@ -374,15 +405,15 @@ func TestANSIRendererSubCellDifferentialEraseBlackBGAndNoColor(t *testing.T) {
 	}
 
 	// Moving down-right to (6.0, 3.0) erases trailing top row (row 3) and trailing left strip (cols 5..6)
-	// with blackBG preserved without blanking overlapping interior cells with full-width spaces.
+	// with blackBG preserved (deduplicated across rows) without blanking overlapping interior cells.
 	out.Reset()
 	_ = ar.DrawFrame(6.0, 3.0, 60, 20, col, "")
 	f2 := out.String()
 	if !strings.Contains(f2, "\x1b[3;5H\x1b[0m\x1b[48;2;0;0;0m                     ") {
 		t.Fatalf("expected differential erase of uncovered top row 3 (21 spaces) with blackBG")
 	}
-	if !strings.Contains(f2, "\x1b[4;5H\x1b[0m\x1b[48;2;0;0;0m  \x1b[") {
-		t.Fatalf("expected differential erase of uncovered 2-col left strip on row 4")
+	if !strings.Contains(f2, "\x1b[4;5H  \x1b[5;5H  \x1b[6;5H  \x1b[7;5H  \x1b[8;5H  \x1b[9;5H  \x1b[4;7H") {
+		t.Fatalf("expected differential erase of uncovered 2-col left strips on rows 4..9 followed by row 4 logo CUP: %q", f2)
 	}
 
 	// ASCII + NO_COLOR strips all RGB TrueColor sequences.
@@ -566,7 +597,6 @@ func TestZeroAllocRenderHotPaths(t *testing.T) {
 	ar := NewANSIRenderer(io.Discard, false, true, false)
 	ar.ResizeLogo(24, 6, true)
 	hud := "bounces: 12  •  corners: 1  •  next corner: 9.4s (bottom-right)"
-	_ = ar.DrawFrame(5.25, 3.125, 120, 36, dvdPalette[0], hud) // warm up internal buffer
 
 	step := 0
 	ansiAllocs := testing.AllocsPerRun(200, func() {
@@ -577,6 +607,49 @@ func TestZeroAllocRenderHotPaths(t *testing.T) {
 	})
 	if ansiAllocs != 0 {
 		t.Fatalf("expected 0 allocs/frame in ANSIRenderer.DrawFrame, got %.1f", ansiAllocs)
+	}
+
+	// Verify double-buffered hudBuilder never allocates AND never aliases prevHUD across mutations.
+	phys := NewPhysics(1600, 960, 360, len(dvdPalette))
+	var hb hudBuilder
+	hb.RefreshETA(phys)
+	prevHUD := hb.Build(phys, ModeKitty, 1.0, false)
+	hudAllocs := testing.AllocsPerRun(200, func() {
+		phys.Bounces++
+		hb.RefreshETA(phys)
+		nextHUD := hb.Build(phys, ModeKitty, 1.0, false)
+		if nextHUD == prevHUD {
+			t.Fatalf("hudBuilder aliased previous HUD string buffer on mutation: %q", nextHUD)
+		}
+		prevHUD = nextHUD
+	})
+	if hudAllocs != 0 {
+		t.Fatalf("expected 0 allocs in hudBuilder.RefreshETA+Build, got %.1f", hudAllocs)
+	}
+
+	// Verify InputParser.Feed + PredictNextCorner incur 0 heap allocations on steady state.
+	var parser InputParser
+	evCh := make(chan InputEvent, 64)
+	pkt := []byte("\x1b[6;36;16t\x1b[<35;40;12M\x1b[A+")
+	parser.Feed(pkt, evCh)
+	for len(evCh) > 0 {
+		<-evCh
+	}
+	inputAllocs := testing.AllocsPerRun(200, func() {
+		parser.Feed(pkt, evCh)
+		for len(evCh) > 0 {
+			<-evCh
+		}
+	})
+	if inputAllocs != 0 {
+		t.Fatalf("expected 0 allocs in InputParser.Feed, got %.1f", inputAllocs)
+	}
+
+	predAllocs := testing.AllocsPerRun(100, func() {
+		_, _, _ = phys.PredictNextCorner(6000)
+	})
+	if predAllocs != 0 {
+		t.Fatalf("expected 0 allocs in Physics.PredictNextCorner, got %.1f", predAllocs)
 	}
 }
 
@@ -640,5 +713,46 @@ func BenchmarkANSIDrawFrame(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = ar.DrawFrame(float64(i%320)*0.25, float64(i%200)*0.125, 120, 36, dvdPalette[i%8], "bounces: 5  •  corners: 0")
+	}
+}
+
+func BenchmarkPredictNextCorner(b *testing.B) {
+	p := NewPhysics(1920, 1080, 420, len(dvdPalette))
+	p.X, p.Y = 317, 211
+	p.VX, p.VY = 295.4, 298.6
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _ = p.PredictNextCorner(6000)
+	}
+}
+
+func BenchmarkHUDBuilder(b *testing.B) {
+	p := NewPhysics(1920, 1080, 420, len(dvdPalette))
+	var hb hudBuilder
+	hb.RefreshETA(p)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.Bounces = i
+		_ = hb.Build(p, ModeKitty, 1.0, false)
+	}
+}
+
+func BenchmarkInputParserFeed(b *testing.B) {
+	var parser InputParser
+	ch := make(chan InputEvent, 16)
+	pkt := []byte("\x1b[6;36;16t\x1b[<35;80;24M\x1b[A")
+	parser.Feed(pkt, ch)
+	for len(ch) > 0 {
+		<-ch
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		parser.Feed(pkt, ch)
+		for len(ch) > 0 {
+			<-ch
+		}
 	}
 }

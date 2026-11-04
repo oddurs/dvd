@@ -5,7 +5,27 @@ import (
 	"image/color"
 	"io"
 	"math"
+	"strconv"
 )
+
+// u8DecTable precomputes ASCII decimal strings for 0..255 so TrueColor SGR escapes
+// format without division or strconv calls on every cell.
+var u8DecTable = func() [256]string {
+	var t [256]string
+	for i := 0; i < 256; i++ {
+		t[i] = strconv.Itoa(i)
+	}
+	return t
+}()
+
+const (
+	sgrUnset   uint32 = 0xFFFFFFFF
+	sgrDefault uint32 = 0xFFFFFFFE
+)
+
+func packRGB(r, g, b uint8) uint32 {
+	return uint32(r)<<16 | uint32(g)<<8 | uint32(b)
+}
 
 // ANSIRenderer renders the vector DVD logo in terminals without Kitty graphics support,
 // using either 4x4 sub-cell anti-aliased TrueColor Unicode half-blocks (▀/▄) or classic ASCII art.
@@ -14,6 +34,10 @@ type ANSIRenderer struct {
 	mask         *LogoMask
 	colsW        int
 	rowsH        int
+	phaseCols    int
+	phaseRows    int
+	phaseData    []uint8
+	phaseBuilt   [32]bool
 	prevCol      int
 	prevRow      int
 	prevW        int
@@ -28,7 +52,7 @@ type ANSIRenderer struct {
 	asciiOnly    bool
 	blackBG      bool
 	noColor      bool
-	buf          bytes.Buffer
+	outBuf       []byte
 	spaces       []byte
 }
 
@@ -50,6 +74,7 @@ func NewANSIRenderer(out io.Writer, asciiOnly, blackBG, noColor bool) *ANSIRende
 		asciiOnly: asciiOnly,
 		blackBG:   blackBG,
 		noColor:   noColor,
+		outBuf:    make([]byte, 0, 8192),
 	}
 }
 
@@ -58,6 +83,13 @@ func (a *ANSIRenderer) resetSGR() string {
 		return "\x1b[0m\x1b[48;2;0;0;0m"
 	}
 	return "\x1b[0m"
+}
+
+func (a *ANSIRenderer) baseBGState() uint32 {
+	if a.blackBG && !a.noColor {
+		return 0 // packed RGB(0,0,0)
+	}
+	return sgrDefault
 }
 
 func (a *ANSIRenderer) ensureSpaces(n int) []byte {
@@ -89,6 +121,42 @@ func (a *ANSIRenderer) ResizeLogo(colsW, rowsH int, includeVideo bool) {
 	a.ensureSpaces(colsW + 1)
 	// 4 horizontal sub-samples per column x 8 vertical sub-samples per row (4x4 per half-block).
 	a.mask = RasterizeDVDMask(colsW*4, rowsH*8, includeVideo)
+
+	a.phaseCols = colsW + 1
+	a.phaseRows = rowsH + 1
+	needPhase := 32 * a.phaseCols * a.phaseRows * 2
+	if cap(a.phaseData) < needPhase {
+		a.phaseData = make([]uint8, needPhase)
+	} else {
+		a.phaseData = a.phaseData[:needPhase]
+	}
+	clear(a.phaseBuilt[:])
+
+	needOut := (a.phaseCols*a.phaseRows)*28 + 1024
+	if cap(a.outBuf) < needOut {
+		a.outBuf = make([]byte, 0, needOut)
+	}
+}
+
+func (a *ANSIRenderer) phaseGrid(remX, remY int) []uint8 {
+	pIdx := remY*4 + remX
+	stride := a.phaseCols * a.phaseRows * 2
+	grid := a.phaseData[pIdx*stride : (pIdx+1)*stride]
+	if !a.phaseBuilt[pIdx] {
+		rowStride := a.phaseCols * 2
+		for r := 0; r < a.phaseRows; r++ {
+			yTop := r*8 - remY
+			yBot := yTop + 4
+			rOff := r * rowStride
+			for c := 0; c < a.phaseCols; c++ {
+				x0 := c*4 - remX
+				grid[rOff+c*2] = a.mask.Sample4x4(x0, yTop)
+				grid[rOff+c*2+1] = a.mask.Sample4x4(x0, yBot)
+			}
+		}
+		a.phaseBuilt[pIdx] = true
+	}
+	return grid
 }
 
 func (a *ANSIRenderer) LogoCells() (w, h int) {
@@ -103,19 +171,19 @@ func (a *ANSIRenderer) ResetPrev() {
 func (a *ANSIRenderer) ClearHUDLine(rows int) {
 	a.prevHUD = ""
 	if rows >= 1 {
-		a.buf.Reset()
-		a.buf.WriteString("\x1b[?2026h\x1b[")
-		writeUint(&a.buf, uint64(rows))
-		a.buf.WriteString(";1H")
-		a.buf.WriteString(a.resetSGR())
-		a.buf.WriteString("\x1b[2K\x1b[?2026l")
-		_, _ = a.out.Write(a.buf.Bytes())
+		b := append(a.outBuf[:0], "\x1b[?2026h\x1b["...)
+		b = strconv.AppendUint(b, uint64(rows), 10)
+		b = append(b, ";1H"...)
+		b = append(b, a.resetSGR()...)
+		b = append(b, "\x1b[2K\x1b[?2026l"...)
+		a.outBuf = b
+		_, _ = a.out.Write(b)
 	}
 }
 
 // DrawFrame renders the logo at fractional cell coordinates (colF, rowF).
 // In TrueColor half-block mode, positions are quantized to quarter-columns x eighth-rows
-// using 4x4 area-integrated sub-cell anti-aliasing and differential trail erasing.
+// using cached 4x4 sub-cell phase grids, cross-row SGR run-length deduplication, and differential trail erasing.
 func (a *ANSIRenderer) DrawFrame(colF, rowF float64, termCols, termRows int, col color.RGBA, hud string) error {
 	if termCols < 1 || termRows < 1 {
 		return nil
@@ -164,11 +232,12 @@ func (a *ANSIRenderer) DrawFrame(colF, rowF float64, termCols, termRows int, col
 	}
 
 	rst := a.resetSGR()
-	a.buf.Reset()
-	a.buf.WriteString("\x1b[?2026h")
+	baseBG := a.baseBGState()
+	b := append(a.outBuf[:0], "\x1b[?2026h"...)
+	curFG := sgrUnset
+	curBG := sgrUnset
 
-	// Differential erase: clear only cells of the previous box that lie outside the new box,
-	// avoiding blank-flash shimmer even in terminals without ?2026h synchronized output.
+	// Differential erase: clear only cells of the previous box that lie outside the new box.
 	if a.hasPrev {
 		pL := max(0, a.prevCol)
 		pR := min(termCols, a.prevCol+a.prevW)
@@ -181,23 +250,35 @@ func (a *ANSIRenderer) DrawFrame(colF, rowF float64, termCols, termRows int, col
 					continue
 				}
 				if pr < row0 || pr >= row0+spanRows || cL >= pR || cR <= pL {
-					writeCup(&a.buf, ry, pL+1)
-					a.buf.WriteString(rst)
-					a.buf.Write(a.ensureSpaces(pR - pL))
+					b = appendCup(b, ry, pL+1)
+					if curBG != baseBG {
+						b = append(b, rst...)
+						curFG = sgrDefault
+						curBG = baseBG
+					}
+					b = append(b, a.ensureSpaces(pR-pL)...)
 					continue
 				}
 				if pL < cL {
 					w := min(pR, cL) - pL
-					writeCup(&a.buf, ry, pL+1)
-					a.buf.WriteString(rst)
-					a.buf.Write(a.ensureSpaces(w))
+					b = appendCup(b, ry, pL+1)
+					if curBG != baseBG {
+						b = append(b, rst...)
+						curFG = sgrDefault
+						curBG = baseBG
+					}
+					b = append(b, a.ensureSpaces(w)...)
 				}
 				if pR > cR {
 					start := max(pL, cR)
 					w := pR - start
-					writeCup(&a.buf, ry, start+1)
-					a.buf.WriteString(rst)
-					a.buf.Write(a.ensureSpaces(w))
+					b = appendCup(b, ry, start+1)
+					if curBG != baseBG {
+						b = append(b, rst...)
+						curFG = sgrDefault
+						curBG = baseBG
+					}
+					b = append(b, a.ensureSpaces(w)...)
 				}
 			}
 		}
@@ -205,14 +286,14 @@ func (a *ANSIRenderer) DrawFrame(colF, rowF float64, termCols, termRows int, col
 
 	if a.asciiOnly {
 		if a.noColor {
-			a.buf.WriteString("\x1b[1m")
+			b = append(b, "\x1b[1m"...)
 		} else {
 			if a.blackBG {
-				a.buf.WriteString("\x1b[48;2;0;0;0m")
+				b = append(b, "\x1b[48;2;0;0;0m"...)
 			}
-			a.buf.WriteString("\x1b[1;38;2;")
-			writeRGB(&a.buf, col.R, col.G, col.B)
-			a.buf.WriteByte('m')
+			b = append(b, "\x1b[1;38;2;"...)
+			b = appendRGB(b, col.R, col.G, col.B)
+			b = append(b, 'm')
 		}
 		for r := 0; r < a.rowsH && r < len(pureASCIIArt); r++ {
 			ry := row0 + r + 1
@@ -227,84 +308,129 @@ func (a *ANSIRenderer) DrawFrame(colF, rowF float64, termCols, termRows int, col
 			if len(line) > maxLen {
 				line = line[:maxLen]
 			}
-			writeCup(&a.buf, ry, col0+1)
-			a.buf.WriteString(line)
+			b = appendCup(b, ry, col0+1)
+			b = append(b, line...)
 		}
-		a.buf.WriteString(rst)
+		b = append(b, rst...)
+		curFG = sgrDefault
+		curBG = baseBG
 	} else if a.mask != nil {
+		grid := a.phaseGrid(remX, remY)
+		rowStride := a.phaseCols * 2
+		colR, colG, colB := uint16(col.R), uint16(col.G), uint16(col.B)
+		maxCols := min(spanCols, termCols-col0)
+		if a.noColor && curFG == sgrUnset {
+			b = append(b, rst...)
+			curFG = sgrDefault
+			curBG = baseBG
+		}
 		for r := 0; r < spanRows; r++ {
 			ry := row0 + r + 1
 			if ry < 1 || ry > termRows {
 				continue
 			}
-			writeCup(&a.buf, ry, col0+1)
-			yTop := r*8 - remY
-			yBot := yTop + 4
-			for c := 0; c < spanCols; c++ {
-				if col0+c >= termCols {
-					break
-				}
-				x0 := c*4 - remX
-				topA := a.mask.Sample4x4(x0, yTop)
-				botA := a.mask.Sample4x4(x0, yBot)
+			b = appendCup(b, ry, col0+1)
+			rOff := r * rowStride
+			for c := 0; c < maxCols; c++ {
+				topA := grid[rOff+c*2]
+				botA := grid[rOff+c*2+1]
 				if topA < 10 && botA < 10 {
-					a.buf.WriteString(rst)
-					a.buf.WriteByte(' ')
+					if !a.noColor && curBG != baseBG {
+						b = append(b, rst...)
+						curFG = sgrDefault
+						curBG = baseBG
+					}
+					b = append(b, ' ')
 					continue
 				}
 				if a.noColor {
 					if topA >= 64 && botA < 64 {
-						a.buf.WriteString("▀")
+						b = append(b, "▀"...)
 					} else if topA < 64 && botA >= 64 {
-						a.buf.WriteString("▄")
+						b = append(b, "▄"...)
 					} else if topA >= 64 && botA >= 64 {
-						a.buf.WriteString("█")
+						b = append(b, "█"...)
 					} else {
-						a.buf.WriteByte(' ')
+						b = append(b, ' ')
 					}
 					continue
 				}
-				tr := uint8((uint16(col.R) * uint16(topA)) / 255)
-				tg := uint8((uint16(col.G) * uint16(topA)) / 255)
-				tb := uint8((uint16(col.B) * uint16(topA)) / 255)
-				br := uint8((uint16(col.R) * uint16(botA)) / 255)
-				bg := uint8((uint16(col.G) * uint16(botA)) / 255)
-				bb := uint8((uint16(col.B) * uint16(botA)) / 255)
+				tr := uint8((colR * uint16(topA)) / 255)
+				tg := uint8((colG * uint16(topA)) / 255)
+				tb := uint8((colB * uint16(topA)) / 255)
+				br := uint8((colR * uint16(botA)) / 255)
+				bg := uint8((colG * uint16(botA)) / 255)
+				bb := uint8((colB * uint16(botA)) / 255)
 				if topA >= 10 && botA < 10 {
-					a.buf.WriteString(rst)
-					a.buf.WriteString("\x1b[38;2;")
-					writeRGB(&a.buf, tr, tg, tb)
-					a.buf.WriteString("m▀")
+					wantFG := packRGB(tr, tg, tb)
+					if curBG != baseBG {
+						b = append(b, rst...)
+						curBG = baseBG
+						curFG = sgrDefault
+					}
+					if curFG != wantFG {
+						b = appendFG(b, tr, tg, tb)
+						curFG = wantFG
+					}
+					b = append(b, "▀"...)
 				} else if topA < 10 && botA >= 10 {
-					a.buf.WriteString(rst)
-					a.buf.WriteString("\x1b[38;2;")
-					writeRGB(&a.buf, br, bg, bb)
-					a.buf.WriteString("m▄")
+					wantFG := packRGB(br, bg, bb)
+					if curBG != baseBG {
+						b = append(b, rst...)
+						curBG = baseBG
+						curFG = sgrDefault
+					}
+					if curFG != wantFG {
+						b = appendFG(b, br, bg, bb)
+						curFG = wantFG
+					}
+					b = append(b, "▄"...)
 				} else {
-					a.buf.WriteString("\x1b[38;2;")
-					writeRGB(&a.buf, tr, tg, tb)
-					a.buf.WriteString("m\x1b[48;2;")
-					writeRGB(&a.buf, br, bg, bb)
-					a.buf.WriteString("m▀")
+					wantFG := packRGB(tr, tg, tb)
+					wantBG := packRGB(br, bg, bb)
+					if wantFG == wantBG {
+						if curFG != wantFG {
+							b = appendFG(b, tr, tg, tb)
+							curFG = wantFG
+						}
+						b = append(b, "█"...)
+						continue
+					}
+					if curFG != wantFG {
+						b = appendFG(b, tr, tg, tb)
+						curFG = wantFG
+					}
+					if curBG != wantBG {
+						b = appendBG(b, br, bg, bb)
+						curBG = wantBG
+					}
+					b = append(b, "▀"...)
 				}
 			}
-			a.buf.WriteString(rst)
+		}
+		if !a.noColor && (curFG != sgrDefault || curBG != baseBG) {
+			b = append(b, rst...)
+			curFG = sgrDefault
+			curBG = baseBG
 		}
 	}
 
 	if hud != "" {
-		writeCup(&a.buf, termRows, 1)
-		a.buf.WriteString(rst)
-		if !a.noColor {
-			a.buf.WriteString("\x1b[2K\x1b[38;5;242m ")
-		} else {
-			a.buf.WriteString("\x1b[2K ")
+		b = appendCup(b, termRows, 1)
+		if curFG != sgrDefault || curBG != baseBG {
+			b = append(b, rst...)
 		}
-		a.buf.WriteString(hud)
-		a.buf.WriteString(rst)
+		if !a.noColor {
+			b = append(b, "\x1b[2K\x1b[38;5;242m "...)
+		} else {
+			b = append(b, "\x1b[2K "...)
+		}
+		b = append(b, hud...)
+		b = append(b, rst...)
 	}
 
-	a.buf.WriteString("\x1b[?2026l")
+	b = append(b, "\x1b[?2026l"...)
+	a.outBuf = b
 
 	a.prevCol = col0
 	a.prevRow = row0
@@ -318,22 +444,42 @@ func (a *ANSIRenderer) DrawFrame(colF, rowF float64, termCols, termRows int, col
 	a.prevTermRows = termRows
 	a.hasPrev = true
 
-	_, err := a.out.Write(a.buf.Bytes())
+	_, err := a.out.Write(b)
 	return err
 }
 
-func writeCup(dst *bytes.Buffer, row1, col1 int) {
-	dst.WriteString("\x1b[")
-	writeUint(dst, uint64(row1))
-	dst.WriteByte(';')
-	writeUint(dst, uint64(col1))
-	dst.WriteByte('H')
+func appendCup(b []byte, row1, col1 int) []byte {
+	b = append(b, "\x1b["...)
+	b = strconv.AppendUint(b, uint64(row1), 10)
+	b = append(b, ';')
+	b = strconv.AppendUint(b, uint64(col1), 10)
+	return append(b, 'H')
 }
 
-func writeRGB(dst *bytes.Buffer, r, g, b uint8) {
-	writeUint(dst, uint64(r))
-	dst.WriteByte(';')
-	writeUint(dst, uint64(g))
-	dst.WriteByte(';')
-	writeUint(dst, uint64(b))
+func appendFG(b []byte, r, g, bl uint8) []byte {
+	b = append(b, "\x1b[38;2;"...)
+	b = append(b, u8DecTable[r]...)
+	b = append(b, ';')
+	b = append(b, u8DecTable[g]...)
+	b = append(b, ';')
+	b = append(b, u8DecTable[bl]...)
+	return append(b, 'm')
+}
+
+func appendBG(b []byte, r, g, bl uint8) []byte {
+	b = append(b, "\x1b[48;2;"...)
+	b = append(b, u8DecTable[r]...)
+	b = append(b, ';')
+	b = append(b, u8DecTable[g]...)
+	b = append(b, ';')
+	b = append(b, u8DecTable[bl]...)
+	return append(b, 'm')
+}
+
+func appendRGB(b []byte, r, g, bl uint8) []byte {
+	b = append(b, u8DecTable[r]...)
+	b = append(b, ';')
+	b = append(b, u8DecTable[g]...)
+	b = append(b, ';')
+	return append(b, u8DecTable[bl]...)
 }
