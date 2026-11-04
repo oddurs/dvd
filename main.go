@@ -10,10 +10,20 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
 )
+
+var version = "v0.2.0"
+
+func buildVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return version
+}
 
 type RenderMode int
 
@@ -43,6 +53,7 @@ type Config struct {
 	Screensaver  bool
 	NoVideoLabel bool
 	BlackBG      bool
+	ShowVersion  bool
 	PreviewPath  string
 }
 
@@ -52,49 +63,48 @@ func main() {
 	flag.IntVar(&cfg.FPS, "fps", 60, "target frames per second (15..240)")
 	flag.Float64Var(&cfg.SpeedMult, "speed", 1.0, "movement speed multiplier (e.g. 0.5, 1.0, 2.0)")
 	flag.Float64Var(&cfg.Scale, "scale", 0.21, "logo width as fraction of screen width (0.06..0.60)")
-	flag.BoolVar(&cfg.ShowStats, "stats", false, "show subtle bottom status bar (bounces, corners, next corner ETA)")
+	flag.BoolVar(&cfg.ShowStats, "stats", false, "show bottom status bar (bounces, corners, next corner ETA)")
 	flag.BoolVar(&cfg.Screensaver, "screensaver", false, "exit immediately on any keypress")
-	flag.BoolVar(&cfg.Screensaver, "x", false, "shorthand for --screensaver (exit on any key)")
+	flag.BoolVar(&cfg.Screensaver, "x", false, "shorthand for -screensaver (exit on any key)")
 	flag.BoolVar(&cfg.NoVideoLabel, "no-video", false, "omit 'VIDEO' label under the DVD disc")
 	flag.BoolVar(&cfg.BlackBG, "black", false, "force opaque pitch-black background instead of terminal default")
-	flag.StringVar(&cfg.PreviewPath, "preview", "", "render a PNG preview of the vector DVD logo to path and exit")
+	flag.BoolVar(&cfg.ShowVersion, "version", false, "print version and exit")
+	flag.BoolVar(&cfg.ShowVersion, "v", false, "shorthand for -version")
+	flag.StringVar(&cfg.PreviewPath, "preview", "", "render a PNG preview sheet of the vector DVD logo to path and exit")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "dvd — CLI DVD Player Screensaver (with native Ghostty / Kitty Graphics support)\n\n")
+		fmt.Fprintf(os.Stderr, "dvd %s — CLI DVD Video screensaver (Kitty Graphics + ANSI/ASCII fallback)\n\n", buildVersion())
 		fmt.Fprintf(os.Stderr, "Usage:\n  dvd [flags]\n\nFlags:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nInteractive Keys:\n")
 		fmt.Fprintf(os.Stderr, "  q / Esc / Ctrl+C   Quit\n")
 		fmt.Fprintf(os.Stderr, "  s / ?              Toggle stats HUD & next-corner countdown\n")
 		fmt.Fprintf(os.Stderr, "  c                  Subtly line up an upcoming corner hit\n")
+		fmt.Fprintf(os.Stderr, "  r                  Randomize position, angle, and color\n")
 		fmt.Fprintf(os.Stderr, "  + / -  (Up / Down) Increase / decrease bounce speed\n")
 		fmt.Fprintf(os.Stderr, "  [ / ]              Shrink / grow logo size\n")
 		fmt.Fprintf(os.Stderr, "  n                  Cycle logo color manually\n")
 		fmt.Fprintf(os.Stderr, "  m                  Switch render mode (kitty -> ansi -> ascii)\n")
+		fmt.Fprintf(os.Stderr, "  Ctrl+L             Force full screen refresh\n")
 		fmt.Fprintf(os.Stderr, "  Space              Pause / resume\n")
 	}
 	flag.Parse()
 
+	if cfg.ShowVersion {
+		fmt.Printf("dvd %s\n", buildVersion())
+		return
+	}
+
 	if cfg.PreviewPath != "" {
 		if err := writePreviewSheet(cfg.PreviewPath, !cfg.NoVideoLabel); err != nil {
-			fmt.Fprintf(os.Stderr, "error writing preview: %v\n", err)
+			fmt.Fprintf(os.Stderr, "dvd: error writing preview: %v\n", err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	if cfg.FPS < 15 {
-		cfg.FPS = 15
-	} else if cfg.FPS > 240 {
-		cfg.FPS = 240
-	}
-	if cfg.Scale < 0.06 {
-		cfg.Scale = 0.06
-	} else if cfg.Scale > 0.60 {
-		cfg.Scale = 0.60
-	}
-	if cfg.SpeedMult <= 0.05 {
-		cfg.SpeedMult = 0.05
-	}
+	cfg.FPS = min(max(15, cfg.FPS), 240)
+	cfg.Scale = clamp(cfg.Scale, 0.06, 0.60)
+	cfg.SpeedMult = clamp(cfg.SpeedMult, 0.05, 10.0)
 
 	if err := runScreensaver(cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "dvd: %v\n", err)
@@ -127,14 +137,15 @@ func runScreensaver(cfg Config) error {
 	// Probe Kitty Graphics support + exact cell pixel size BEFORE starting the input reader goroutine.
 	kittySupported, csiCellW, csiCellH := ProbeCapabilities(ttyIn, ttyOut)
 
-	mode, err := resolveInitialMode(cfg.ModeFlag, kittySupported)
+	noColor := os.Getenv("NO_COLOR") != ""
+	mode, err := resolveInitialMode(cfg.ModeFlag, kittySupported, noColor)
 	if err != nil {
 		rawState.Restore()
 		return err
 	}
 
-	kitty := NewKittyRenderer(ttyOut)
-	ansi := NewANSIRenderer(ttyOut, mode == ModeASCII)
+	kitty := NewKittyRenderer(ttyOut, cfg.BlackBG)
+	ansi := NewANSIRenderer(ttyOut, mode == ModeASCII, cfg.BlackBG, noColor)
 
 	cleanedUp := false
 	cleanup := func() {
@@ -142,6 +153,7 @@ func runScreensaver(cfg Config) error {
 			return
 		}
 		cleanedUp = true
+		_, _ = ttyOut.WriteString("\x1b[?2026l")
 		if kittySupported || mode == ModeKitty {
 			kitty.ClearAll()
 		}
@@ -152,7 +164,7 @@ func runScreensaver(cfg Config) error {
 
 	// Enter alternate screen and hide cursor.
 	enterSeq := "\x1b[?1049h\x1b[?25l"
-	if cfg.BlackBG {
+	if cfg.BlackBG && !noColor {
 		enterSeq += "\x1b[48;2;0;0;0m"
 	} else {
 		enterSeq += "\x1b[0m"
@@ -172,9 +184,11 @@ func runScreensaver(cfg Config) error {
 	// Set up signal handlers for clean exit and live terminal resize.
 	sigExit := make(chan os.Signal, 2)
 	signal.Notify(sigExit, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigExit)
 
 	sigWinch := make(chan os.Signal, 2)
 	signal.Notify(sigWinch, syscall.SIGWINCH)
+	defer signal.Stop(sigWinch)
 
 	inputCh := make(chan InputEvent, 32)
 	StartInputReader(ttyIn, inputCh)
@@ -210,8 +224,8 @@ func runScreensaver(cfg Config) error {
 			if flash {
 				col = cornerFlashColor
 			}
-			c0 := int(math.Round(phys.X / float64(metrics.CellW)))
-			r0 := int(math.Round(phys.Y / float64(metrics.CellH)))
+			c0 := int(math.Round(phys.X / float64(max(1, metrics.CellW))))
+			r0 := int(math.Round(phys.Y / float64(max(1, metrics.CellH))))
 			lw, lh := ansi.LogoCells()
 			if c0 > metrics.Cols-lw {
 				c0 = max(0, metrics.Cols-lw)
@@ -223,13 +237,21 @@ func runScreensaver(cfg Config) error {
 		}
 	}
 
+	clearHUD := func() {
+		if mode == ModeKitty {
+			kitty.ClearHUDLine(metrics.Rows)
+		} else {
+			ansi.ClearHUDLine(metrics.Rows)
+		}
+	}
+
 	reconfigure := func(clearScreen bool) {
 		if clearScreen {
 			if mode != ModeKitty && kittySupported {
 				kitty.ClearAll()
 			}
 			bg := "\x1b[0m"
-			if cfg.BlackBG {
+			if cfg.BlackBG && !noColor {
 				bg = "\x1b[48;2;0;0;0m"
 			}
 			_, _ = ttyOut.WriteString(bg + "\x1b[2J\x1b[H")
@@ -304,11 +326,14 @@ func runScreensaver(cfg Config) error {
 			switch ev.Action {
 			case ActionQuit:
 				return nil
+			case ActionRedraw:
+				metrics = QueryMetrics(int(ttyOut.Fd()), csiCellW, csiCellH)
+				reconfigure(true)
 			case ActionToggleStats:
 				showStats = !showStats
 				lastETACalc = time.Time{}
 				if !showStats {
-					kitty.ClearHUDLine(metrics.Rows)
+					clearHUD()
 				}
 				renderFrame(time.Now())
 			case ActionTogglePause:
@@ -318,6 +343,10 @@ func runScreensaver(cfg Config) error {
 			case ActionAimCorner:
 				phys.AimForCorner()
 				lastETACalc = time.Time{}
+			case ActionRandomize:
+				phys.Randomize()
+				lastETACalc = time.Time{}
+				renderFrame(time.Now())
 			case ActionSpeedUp:
 				cfg.SpeedMult = math.Min(8.0, cfg.SpeedMult*1.2)
 				phys.SetSpeed(computePixelSpeed(metrics, cfg.SpeedMult))
@@ -370,11 +399,14 @@ func runScreensaver(cfg Config) error {
 	}
 }
 
-func resolveInitialMode(flagVal string, kittySupported bool) (RenderMode, error) {
+func resolveInitialMode(flagVal string, kittySupported, noColor bool) (RenderMode, error) {
 	switch strings.ToLower(strings.TrimSpace(flagVal)) {
 	case "auto", "":
 		if kittySupported {
 			return ModeKitty, nil
+		}
+		if noColor {
+			return ModeASCII, nil
 		}
 		return ModeANSI, nil
 	case "kitty", "graphics":
@@ -384,7 +416,7 @@ func resolveInitialMode(flagVal string, kittySupported bool) (RenderMode, error)
 	case "ascii", "text":
 		return ModeASCII, nil
 	default:
-		return ModeANSI, fmt.Errorf("unknown --mode %q (expected auto, kitty, ansi, or ascii)", flagVal)
+		return ModeANSI, fmt.Errorf("unknown -mode %q (expected auto, kitty, ansi, or ascii)", flagVal)
 	}
 }
 
@@ -426,16 +458,13 @@ func computeArenaAndUpload(
 	// ANSI / ASCII cell-aligned bounds mapped onto virtual pixel coordinates.
 	colsW := int(math.Round(float64(m.Cols) * scale))
 	if colsW < 14 {
-		colsW = min(m.Cols-2, 14)
+		colsW = min(max(4, m.Cols-2), 14)
 	}
 	cellAspect := float64(m.CellH) / float64(max(1, m.CellW))
 	if cellAspect < 1.2 || cellAspect > 3.2 {
 		cellAspect = 2.0
 	}
-	rowsH := int(math.Round(float64(colsW) / (aspect * cellAspect)))
-	if rowsH < 4 {
-		rowsH = 4
-	}
+	rowsH := max(4, int(math.Round(float64(colsW)/(aspect*cellAspect))))
 	ansi.ResizeLogo(colsW, rowsH, includeVideo)
 	lw, lh := ansi.LogoCells()
 	maxX = math.Max(1, float64(max(1, m.Cols-lw)*m.CellW))
@@ -457,13 +486,14 @@ func formatNextCornerETA(p *Physics) string {
 	if secs < 60 {
 		return fmt.Sprintf("next corner: %.1fs (%s)", secs, cname)
 	}
-	mins := int(secs) / 60
-	rem := int(math.Round(secs)) % 60
+	totalSec := int(math.Round(secs))
+	mins := totalSec / 60
+	rem := totalSec % 60
 	return fmt.Sprintf("next corner: %dm%02ds (%s)", mins, rem, cname)
 }
 
 func buildHUD(p *Physics, mode RenderMode, speedMult float64, paused bool, eta string) string {
-	var parts []string
+	parts := make([]string, 0, 6)
 	parts = append(parts, fmt.Sprintf("bounces: %d", p.Bounces))
 	parts = append(parts, fmt.Sprintf("corners: %d", p.Corners))
 	parts = append(parts, eta)
@@ -485,7 +515,6 @@ func writePreviewSheet(outPath string, includeVideo bool) error {
 	// Fill with sleek Ghostty dark background (#14161B).
 	draw.Draw(canvas, canvas.Bounds(), &image.Uniform{color.RGBA{0x14, 0x16, 0x1B, 0xFF}}, image.Point{}, draw.Src)
 
-	// Draw subtle terminal border & corner highlight.
 	aspect := LogoAspectRatio(includeVideo)
 	heroW := 420
 	heroH := int(math.Round(float64(heroW) / aspect))
@@ -493,7 +522,6 @@ func writePreviewSheet(outPath string, includeVideo bool) error {
 	heroImg := heroMask.TintRGBA(dvdPalette[0])
 	draw.Draw(canvas, image.Rect((W-heroW)/2, 65, (W+heroW)/2, 65+heroH), heroImg, image.Point{}, draw.Over)
 
-	// Render smaller palette swatches along the bottom row.
 	smallW := 180
 	smallH := int(math.Round(float64(smallW) / aspect))
 	smallMask := RasterizeDVDMask(smallW, smallH, includeVideo)
@@ -515,6 +543,9 @@ func writePreviewSheet(outPath string, includeVideo bool) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	return png.Encode(f, canvas)
+	if err := png.Encode(f, canvas); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }

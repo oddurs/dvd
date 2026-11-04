@@ -7,12 +7,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 )
 
-// Classic DVD logo vector paths (viewBox: 0 0 162 92).
-// Top portion (y: 0..72.5): Wikimedia public-domain DVD wordmark + elliptical disc with cutout hole.
-// Bottom portion (y: 77..90): Wide-tracked geometric "V I D E O" lettering centered beneath the disc.
+// Classic DVD logo vector paths (viewBox: 0 0 160.5 90.5).
+// Top portion (y: 0..72.3): Wikimedia public-domain DVD wordmark + elliptical disc (x: 0..151.2, center 75.6) with cutout hole.
+// Bottom portion (y: 77.2..89.8): Optically kerned geometric "V I D E O" lettering centered at x=75.6 beneath the disc.
 const dvdWordmarkAndDiscPath = `
 M 91.2 12.7 C 91.2 12.7 80.2 26.3 80.8 27.1 C 81.6 26.3 76.8 12.5 76.8 12.5 S 75.8 9.7 72.8 0.1
 H 13.8 L 11.8 8.9 H 30.8 C 40.8 8.9 46.8 13.1 45.2 20.3 C 43.4 28.3 34.8 31.7 25.4 31.7
@@ -27,16 +28,16 @@ M 72.8 65.1 C 63.2 65.1 55.6 63.5 55.6 61.5 C 55.6 59.5 63.2 57.9 72.8 57.9
 C 82.4 57.9 90 59.5 90 61.5 C 90 63.5 82.4 65.1 72.8 65.1 Z
 `
 
-// Crisp geometric "V I D E O" sub-label centered under the disc (around x=75.6, y=77.5..89.5).
+// Crisp geometric "V I D E O" sub-label optically kerned and centered under the disc at x=75.6 (span 24.5..126.7).
 // Uses even-odd fill rule so interior counters (D and O holes) cut out cleanly.
 const dvdVideoLabelPath = `
-M 31.0 77.5 L 33.7 77.5 L 36.7 86.2 L 39.7 77.5 L 42.4 77.5 L 37.9 89.5 L 35.5 89.5 Z
-M 53.0 77.5 H 55.6 V 89.5 H 53.0 Z
-M 66.8 77.5 H 71.8 C 75.7 77.5 78.2 79.8 78.2 83.5 C 78.2 87.2 75.7 89.5 71.8 89.5 H 66.8 Z
-M 69.3 79.7 V 87.3 H 71.6 C 74.1 87.3 75.6 85.8 75.6 83.5 C 75.6 81.2 74.1 79.7 71.6 79.7 Z
-M 89.2 77.5 H 98.2 V 79.7 H 91.8 V 82.3 H 97.5 V 84.5 H 91.8 V 87.3 H 98.4 V 89.5 H 89.2 Z
-M 114.8 77.2 C 118.7 77.2 121.4 79.8 121.4 83.5 C 121.4 87.2 118.7 89.8 114.8 89.8 C 110.9 89.8 108.2 87.2 108.2 83.5 C 108.2 79.8 110.9 77.2 114.8 77.2 Z
-M 114.8 79.5 C 112.4 79.5 110.8 81.1 110.8 83.5 C 110.8 85.9 112.4 87.5 114.8 87.5 C 117.2 87.5 118.8 85.9 118.8 83.5 C 118.8 81.1 117.2 79.5 114.8 79.5 Z
+M 24.5 77.5 L 27.3 77.5 L 30.3 86.2 L 33.3 77.5 L 36.1 77.5 L 31.5 89.5 L 29.1 89.5 Z
+M 48.3 77.5 H 51.0 V 89.5 H 48.3 Z
+M 65.0 77.5 H 70.0 C 73.9 77.5 76.6 79.8 76.6 83.5 C 76.6 87.2 73.9 89.5 70.0 89.5 H 65.0 Z
+M 67.6 79.7 V 87.3 H 69.9 C 72.4 87.3 73.9 85.8 73.9 83.5 C 73.9 81.2 72.4 79.7 69.9 79.7 Z
+M 90.6 77.5 H 99.8 V 79.7 H 93.2 V 82.3 H 99.0 V 84.5 H 93.2 V 87.3 H 100.0 V 89.5 H 90.6 Z
+M 120.0 77.2 C 123.9 77.2 126.7 79.8 126.7 83.5 C 126.7 87.2 123.9 89.8 120.0 89.8 C 116.1 89.8 113.3 87.2 113.3 83.5 C 113.3 79.8 116.1 77.2 120.0 77.2 Z
+M 120.0 79.5 C 117.6 79.5 116.0 81.1 116.0 83.5 C 116.0 85.9 117.6 87.5 120.0 87.5 C 122.4 87.5 124.0 85.9 124.0 83.5 C 124.0 81.1 122.4 79.5 120.0 79.5 Z
 `
 
 const (
@@ -67,6 +68,23 @@ type edge struct {
 	x0, y0, x1, y1 float64
 }
 
+var (
+	polyOnce      sync.Once
+	polysWithText [][]pt
+	polysNoText   [][]pt
+)
+
+func cachedDVDPolygons(includeVideo bool) [][]pt {
+	polyOnce.Do(func() {
+		polysNoText = parseSVGPolygons(dvdWordmarkAndDiscPath)
+		polysWithText = parseSVGPolygons(dvdWordmarkAndDiscPath + "\n" + dvdVideoLabelPath)
+	})
+	if includeVideo {
+		return polysWithText
+	}
+	return polysNoText
+}
+
 // LogoMask stores a supersampled alpha mask of the DVD vector logo at target pixel dimensions.
 type LogoMask struct {
 	Width  int
@@ -74,7 +92,7 @@ type LogoMask struct {
 	Alpha  []uint8 // len = Width * Height, row-major
 }
 
-// AspectRatio returns width / height for the vector logo.
+// LogoAspectRatio returns width / height for the vector logo.
 func LogoAspectRatio(includeVideo bool) float64 {
 	if includeVideo {
 		return logoViewWidth / logoViewHeightVideo
@@ -92,14 +110,11 @@ func RasterizeDVDMask(width, height int, includeVideo bool) *LogoMask {
 		height = 2
 	}
 
-	srcPath := dvdWordmarkAndDiscPath
 	viewH := logoViewHeightNoText
 	if includeVideo {
-		srcPath += "\n" + dvdVideoLabelPath
 		viewH = logoViewHeightVideo
 	}
-
-	polys := parseSVGPolygons(srcPath)
+	polys := cachedDVDPolygons(includeVideo)
 
 	// Add a 1-pixel padding margin on each side so anti-aliased outer edges never clip harshly.
 	padX := 1.0
@@ -137,9 +152,7 @@ func RasterizeDVDMask(width, height int, includeVideo bool) *LogoMask {
 	var xs []float64
 
 	for py := 0; py < height; py++ {
-		for i := range counts {
-			counts[i] = 0
-		}
+		clear(counts)
 		for syIdx := 0; syIdx < sub; syIdx++ {
 			scanY := float64(py) + (float64(syIdx)+0.5)/float64(sub)
 			xs = xs[:0]
@@ -160,17 +173,18 @@ func RasterizeDVDMask(width, height int, includeVideo bool) *LogoMask {
 				if right <= 0 || left >= float64(width) {
 					continue
 				}
-				minPx := int(math.Floor(left))
-				if minPx < 0 {
-					minPx = 0
-				}
-				maxPx := int(math.Ceil(right))
-				if maxPx > width {
-					maxPx = width
-				}
+				minPx := max(0, int(math.Floor(left)))
+				maxPx := min(width, int(math.Ceil(right)))
 				for px := minPx; px < maxPx; px++ {
+					pxLo := float64(px)
+					pxHi := float64(px + 1)
+					// Fast path: full pixel span lies strictly inside [left, right).
+					if pxLo >= left && pxHi <= right {
+						counts[px] += sub
+						continue
+					}
 					for sxIdx := 0; sxIdx < sub; sxIdx++ {
-						sampleX := float64(px) + (float64(sxIdx)+0.5)/float64(sub)
+						sampleX := pxLo + (float64(sxIdx)+0.5)/float64(sub)
 						if sampleX >= left && sampleX < right {
 							counts[px]++
 						}
@@ -182,7 +196,6 @@ func RasterizeDVDMask(width, height int, includeVideo bool) *LogoMask {
 		rowOff := py * width
 		for px, c := range counts {
 			if c > 0 {
-				// Map 0..64 linearly to 0..255 with slight perceptual curve for crisp anti-aliased edges.
 				cov := float64(c) / float64(sub*sub)
 				alpha[rowOff+px] = uint8(math.Round(cov * 255.0))
 			}
@@ -203,6 +216,12 @@ func (m *LogoMask) TintRGBA(col color.RGBA) *image.NRGBA {
 
 // TintPaddedRGBA renders the tinted mask at (offsetX, offsetY) inside a transparent texW x texH canvas.
 func (m *LogoMask) TintPaddedRGBA(col color.RGBA, texW, texH, offsetX, offsetY int) *image.NRGBA {
+	if offsetX < 0 {
+		offsetX = 0
+	}
+	if offsetY < 0 {
+		offsetY = 0
+	}
 	if texW < m.Width+offsetX {
 		texW = m.Width + offsetX
 	}
@@ -415,4 +434,23 @@ func tokenizeSVGPath(d string) []string {
 	}
 	flush()
 	return tokens
+}
+
+// truncateRunes truncates s to at most maxRunes Unicode code points without splitting multi-byte UTF-8 runes.
+func truncateRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	// Fast path: every rune is >= 1 byte, so if byte length <= maxRunes it already fits.
+	if len(s) <= maxRunes {
+		return s
+	}
+	count := 0
+	for idx := range s {
+		if count == maxRunes {
+			return s[:idx]
+		}
+		count++
+	}
+	return s
 }

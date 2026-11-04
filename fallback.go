@@ -2,13 +2,12 @@ package main
 
 import (
 	"bytes"
-	"fmt"
 	"image/color"
 	"io"
 )
 
 // ANSIRenderer renders the vector DVD logo in terminals without Kitty graphics support,
-// using either TrueColor Unicode half-blocks (▀/▄/█) or classic retro ASCII art.
+// using either TrueColor Unicode half-blocks (▀/▄) or classic retro ASCII art.
 type ANSIRenderer struct {
 	out       io.Writer
 	mask      *LogoMask
@@ -20,7 +19,10 @@ type ANSIRenderer struct {
 	prevH     int
 	hasPrev   bool
 	asciiOnly bool
+	blackBG   bool
+	noColor   bool
 	buf       bytes.Buffer
+	spaces    []byte
 }
 
 var pureASCIIArt = []string{
@@ -35,11 +37,27 @@ var pureASCIIArt = []string{
 	`     V  I  D  E  O    `,
 }
 
-func NewANSIRenderer(out io.Writer, asciiOnly bool) *ANSIRenderer {
+func NewANSIRenderer(out io.Writer, asciiOnly, blackBG, noColor bool) *ANSIRenderer {
 	return &ANSIRenderer{
 		out:       out,
 		asciiOnly: asciiOnly,
+		blackBG:   blackBG,
+		noColor:   noColor,
 	}
+}
+
+func (a *ANSIRenderer) resetSGR() string {
+	if a.blackBG && !a.noColor {
+		return "\x1b[0m\x1b[48;2;0;0;0m"
+	}
+	return "\x1b[0m"
+}
+
+func (a *ANSIRenderer) ensureSpaces(n int) []byte {
+	if len(a.spaces) < n {
+		a.spaces = bytes.Repeat([]byte{' '}, n)
+	}
+	return a.spaces[:n]
 }
 
 func (a *ANSIRenderer) ResizeLogo(colsW, rowsH int, includeVideo bool) {
@@ -47,8 +65,9 @@ func (a *ANSIRenderer) ResizeLogo(colsW, rowsH int, includeVideo bool) {
 		a.colsW = len(pureASCIIArt[0])
 		a.rowsH = len(pureASCIIArt)
 		if !includeVideo {
-			a.rowsH -= 1
+			a.rowsH--
 		}
+		a.ensureSpaces(a.colsW)
 		return
 	}
 	if colsW < 10 {
@@ -59,6 +78,7 @@ func (a *ANSIRenderer) ResizeLogo(colsW, rowsH int, includeVideo bool) {
 	}
 	a.colsW = colsW
 	a.rowsH = rowsH
+	a.ensureSpaces(colsW)
 	// Each terminal row encodes 2 vertical subpixels via half-block characters.
 	a.mask = RasterizeDVDMask(colsW, rowsH*2, includeVideo)
 }
@@ -71,7 +91,22 @@ func (a *ANSIRenderer) ResetPrev() {
 	a.hasPrev = false
 }
 
+func (a *ANSIRenderer) ClearHUDLine(rows int) {
+	if rows >= 1 {
+		a.buf.Reset()
+		a.buf.WriteString("\x1b[?2026h\x1b[")
+		writeUint(&a.buf, uint64(rows))
+		a.buf.WriteString(";1H")
+		a.buf.WriteString(a.resetSGR())
+		a.buf.WriteString("\x1b[2K\x1b[?2026l")
+		_, _ = a.out.Write(a.buf.Bytes())
+	}
+}
+
 func (a *ANSIRenderer) DrawFrame(col0, row0, termCols, termRows int, col color.RGBA, hud string) error {
+	if termCols < 1 || termRows < 1 {
+		return nil
+	}
 	if col0 < 0 {
 		col0 = 0
 	}
@@ -79,6 +114,7 @@ func (a *ANSIRenderer) DrawFrame(col0, row0, termCols, termRows int, col color.R
 		row0 = 0
 	}
 
+	rst := a.resetSGR()
 	a.buf.Reset()
 	a.buf.WriteString("\x1b[?2026h")
 
@@ -89,22 +125,30 @@ func (a *ANSIRenderer) DrawFrame(col0, row0, termCols, termRows int, col color.R
 			if ry < 1 || ry > termRows {
 				continue
 			}
-			cx := a.prevCol + 1
-			if cx < 1 {
-				cx = 1
-			}
+			cx := max(1, a.prevCol+1)
 			w := a.prevW
 			if cx+w-1 > termCols {
 				w = termCols - cx + 1
 			}
 			if w > 0 {
-				fmt.Fprintf(&a.buf, "\x1b[%d;%dH\x1b[0m%*s", ry, cx, w, "")
+				writeCup(&a.buf, ry, cx)
+				a.buf.WriteString(rst)
+				a.buf.Write(a.ensureSpaces(w))
 			}
 		}
 	}
 
 	if a.asciiOnly {
-		fmt.Fprintf(&a.buf, "\x1b[1;38;2;%d;%d;%dm", col.R, col.G, col.B)
+		if a.noColor {
+			a.buf.WriteString("\x1b[1m")
+		} else {
+			if a.blackBG {
+				a.buf.WriteString("\x1b[48;2;0;0;0m")
+			}
+			a.buf.WriteString("\x1b[1;38;2;")
+			writeRGB(&a.buf, col.R, col.G, col.B)
+			a.buf.WriteByte('m')
+		}
 		for r := 0; r < a.rowsH && r < len(pureASCIIArt); r++ {
 			ry := row0 + r + 1
 			if ry < 1 || ry > termRows {
@@ -118,16 +162,17 @@ func (a *ANSIRenderer) DrawFrame(col0, row0, termCols, termRows int, col color.R
 			if len(line) > maxLen {
 				line = line[:maxLen]
 			}
-			fmt.Fprintf(&a.buf, "\x1b[%d;%dH%s", ry, col0+1, line)
+			writeCup(&a.buf, ry, col0+1)
+			a.buf.WriteString(line)
 		}
-		a.buf.WriteString("\x1b[0m")
+		a.buf.WriteString(rst)
 	} else if a.mask != nil {
 		for r := 0; r < a.rowsH; r++ {
 			ry := row0 + r + 1
 			if ry < 1 || ry > termRows {
 				continue
 			}
-			fmt.Fprintf(&a.buf, "\x1b[%d;%dH", ry, col0+1)
+			writeCup(&a.buf, ry, col0+1)
 			for c := 0; c < a.colsW; c++ {
 				if col0+c >= termCols {
 					break
@@ -135,32 +180,49 @@ func (a *ANSIRenderer) DrawFrame(col0, row0, termCols, termRows int, col color.R
 				topA := a.mask.Sample(c, r*2)
 				botA := a.mask.Sample(c, r*2+1)
 				if topA < 32 && botA < 32 {
-					a.buf.WriteString("\x1b[0m ")
+					a.buf.WriteString(rst)
+					a.buf.WriteByte(' ')
 					continue
 				}
-				tr := (int(col.R) * int(topA)) / 255
-				tg := (int(col.G) * int(topA)) / 255
-				tb := (int(col.B) * int(topA)) / 255
-				br := (int(col.R) * int(botA)) / 255
-				bg := (int(col.G) * int(botA)) / 255
-				bb := (int(col.B) * int(botA)) / 255
+				tr := uint8((uint16(col.R) * uint16(topA)) / 255)
+				tg := uint8((uint16(col.G) * uint16(topA)) / 255)
+				tb := uint8((uint16(col.B) * uint16(topA)) / 255)
+				br := uint8((uint16(col.R) * uint16(botA)) / 255)
+				bg := uint8((uint16(col.G) * uint16(botA)) / 255)
+				bb := uint8((uint16(col.B) * uint16(botA)) / 255)
 				if topA >= 32 && botA < 32 {
-					fmt.Fprintf(&a.buf, "\x1b[0m\x1b[38;2;%d;%d;%dm▀", tr, tg, tb)
+					a.buf.WriteString(rst)
+					a.buf.WriteString("\x1b[38;2;")
+					writeRGB(&a.buf, tr, tg, tb)
+					a.buf.WriteString("m▀")
 				} else if topA < 32 && botA >= 32 {
-					fmt.Fprintf(&a.buf, "\x1b[0m\x1b[38;2;%d;%d;%dm▄", br, bg, bb)
+					a.buf.WriteString(rst)
+					a.buf.WriteString("\x1b[38;2;")
+					writeRGB(&a.buf, br, bg, bb)
+					a.buf.WriteString("m▄")
 				} else {
-					fmt.Fprintf(&a.buf, "\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm▀", tr, tg, tb, br, bg, bb)
+					a.buf.WriteString("\x1b[38;2;")
+					writeRGB(&a.buf, tr, tg, tb)
+					a.buf.WriteString("m\x1b[48;2;")
+					writeRGB(&a.buf, br, bg, bb)
+					a.buf.WriteString("m▀")
 				}
 			}
-			a.buf.WriteString("\x1b[0m")
+			a.buf.WriteString(rst)
 		}
 	}
 
-	if hud != "" && termRows >= 2 {
-		if len(hud) > termCols-2 && termCols > 4 {
-			hud = hud[:termCols-2]
+	if hud != "" && termRows >= 2 && termCols > 4 {
+		hud = truncateRunes(hud, termCols-2)
+		writeCup(&a.buf, termRows, 1)
+		a.buf.WriteString(rst)
+		if !a.noColor {
+			a.buf.WriteString("\x1b[2K\x1b[38;5;242m ")
+		} else {
+			a.buf.WriteString("\x1b[2K ")
 		}
-		fmt.Fprintf(&a.buf, "\x1b[%d;1H\x1b[2K\x1b[38;5;242m %s\x1b[0m", termRows, hud)
+		a.buf.WriteString(hud)
+		a.buf.WriteString(rst)
 	}
 
 	a.buf.WriteString("\x1b[?2026l")
@@ -173,4 +235,20 @@ func (a *ANSIRenderer) DrawFrame(col0, row0, termCols, termRows int, col color.R
 
 	_, err := a.out.Write(a.buf.Bytes())
 	return err
+}
+
+func writeCup(dst *bytes.Buffer, row1, col1 int) {
+	dst.WriteString("\x1b[")
+	writeUint(dst, uint64(row1))
+	dst.WriteByte(';')
+	writeUint(dst, uint64(col1))
+	dst.WriteByte('H')
+}
+
+func writeRGB(dst *bytes.Buffer, r, g, b uint8) {
+	writeUint(dst, uint64(r))
+	dst.WriteByte(';')
+	writeUint(dst, uint64(g))
+	dst.WriteByte(';')
+	writeUint(dst, uint64(b))
 }

@@ -1,5 +1,9 @@
 # dvd
 
+<p align="center">
+  <img src="assets/demo.svg" alt="dvd terminal screensaver preview" width="720">
+</p>
+
 Classic bouncing **DVD Video** screensaver for the terminal—rendered as crisp vector graphics via the **Kitty Graphics Protocol** in **Ghostty**, **Kitty**, and **WezTerm**, with automatic fallback to TrueColor half-blocks (`▀`/`▄`) or ASCII everywhere else.
 
 Zero external dependencies. Pure Go.
@@ -10,7 +14,7 @@ Zero external dependencies. Pure Go.
 go install github.com/oddurs/dvd@latest
 ```
 
-Or build from source:
+Or grab a prebuilt binary from [Releases](https://github.com/oddurs/dvd/releases), or build from source:
 
 ```sh
 git clone https://github.com/oddurs/dvd.git
@@ -40,7 +44,10 @@ dvd -fps 120 -black  # 120 FPS on pitch-black background
   -black         force opaque pitch-black background instead of terminal default
   -no-video      omit 'VIDEO' label under the DVD disc
   -preview file  render a PNG preview sheet of the vector DVD logo and exit
+  -v, -version   print version and exit
 ```
+
+Respects [`NO_COLOR`](https://no-color.org/) automatically.
 
 ### Keys
 
@@ -49,15 +56,17 @@ dvd -fps 120 -black  # 120 FPS on pitch-black background
 | `q` / `Esc` / `Ctrl+C` | Quit |
 | `s` / `?` | Toggle stats HUD & next-corner ETA |
 | `c` | Subtly nudge angle to line up an upcoming corner hit |
+| `r` | Randomize position, angle, and palette color |
 | `+` / `-` (`Up` / `Down`) | Adjust bounce speed |
 | `[` / `]` | Shrink / grow logo (live vector re-rasterization) |
 | `n` | Cycle palette color |
 | `m` | Cycle render mode (`kitty` → `ansi` → `ascii`) |
+| `Ctrl+L` | Force full screen refresh |
 | `Space` | Pause / resume |
 
 ## How It Works
 
-At startup, `dvd` probes Kitty Graphics Protocol support and cell pixel dimensions (`TIOCGWINSZ`, `CSI 16t`, `CSI 14t`), rasterizes the **DVD Video** SVG paths with 8×8 supersampled scanline anti-aliasing, and uploads padded palette textures to terminal GPU memory (`a=t,f=100`). Each frame updates a constant `(c, r)` cell box using a sliding source crop (`x, y, w, h`) wrapped in synchronized output (`?2026h`), yielding tear-free single-pixel diagonal motion without cell-boundary stretching.
+At startup, `dvd` probes Kitty Graphics Protocol support and cell pixel dimensions (`TIOCGWINSZ`, `CSI 16t`, `CSI 14t`), rasterizes the **DVD Video** SVG paths with 8×8 supersampled scanline anti-aliasing, and uploads padded palette textures to terminal GPU memory (`a=t,f=100`). Each frame updates a constant `(c, r)` cell box using a sliding source crop (`x, y, w, h`) wrapped in synchronized output (`?2026h`) with zero heap allocations per frame, yielding tear-free single-pixel diagonal motion without cell-boundary stretching.
 
 ## License
 

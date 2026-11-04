@@ -35,12 +35,8 @@ type Physics struct {
 
 func NewPhysics(maxX, maxY, speed float64, numColors int) *Physics {
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	if maxX < 1 {
-		maxX = 1
-	}
-	if maxY < 1 {
-		maxY = 1
-	}
+	maxX = math.Max(1, maxX)
+	maxY = math.Max(1, maxY)
 	if numColors < 1 {
 		numColors = 1
 	}
@@ -54,41 +50,39 @@ func NewPhysics(maxX, maxY, speed float64, numColors int) *Physics {
 		NumColors: numColors,
 		rng:       rng,
 	}
+	p.Randomize()
+	return p
+}
 
-	// Start away from immediate walls at a classic ~45-degree angle with slight organic jitter
-	// so trajectories explore the entire screen rather than locking into a 2-wall loop.
-	p.X = (0.18 + 0.64*rng.Float64()) * maxX
-	p.Y = (0.18 + 0.64*rng.Float64()) * maxY
+// Randomize places the logo at a fresh interior position with a classic ~45-degree diagonal velocity.
+func (p *Physics) Randomize() {
+	p.X = (0.18 + 0.64*p.rng.Float64()) * p.MaxX
+	p.Y = (0.18 + 0.64*p.rng.Float64()) * p.MaxY
 
-	angle := math.Pi/4.0 + (rng.Float64()-0.5)*0.06 // ~45° ± 1.7°
+	angle := math.Pi/4.0 + (p.rng.Float64()-0.5)*0.06 // ~45° ± 1.7°
 	sx := 1.0
-	if rng.Intn(2) == 0 {
+	if p.rng.Intn(2) == 0 {
 		sx = -1.0
 	}
 	sy := 1.0
-	if rng.Intn(2) == 0 {
+	if p.rng.Intn(2) == 0 {
 		sy = -1.0
 	}
-	p.VX = sx * speed * math.Cos(angle)
-	p.VY = sy * speed * math.Sin(angle)
-	return p
+	p.VX = sx * p.Speed * math.Cos(angle)
+	p.VY = sy * p.Speed * math.Sin(angle)
+	p.nextColor()
 }
 
 func computeCornerTol(maxX, maxY float64) float64 {
 	minDim := math.Min(maxX, maxY)
 	// ~3.5 physical pixels on Retina displays, scaled down on tiny grids.
-	tol := math.Max(1.5, math.Min(4.0, minDim*0.006))
-	return tol
+	return math.Max(1.5, math.Min(4.0, minDim*0.006))
 }
 
 // UpdateBounds rescales/clamps the logo position smoothly when the window or logo resizes.
 func (p *Physics) UpdateBounds(newMaxX, newMaxY float64) {
-	if newMaxX < 1 {
-		newMaxX = 1
-	}
-	if newMaxY < 1 {
-		newMaxY = 1
-	}
+	newMaxX = math.Max(1, newMaxX)
+	newMaxY = math.Max(1, newMaxY)
 	if p.MaxX > 0 {
 		p.X = (p.X / p.MaxX) * newMaxX
 	}
@@ -104,12 +98,7 @@ func (p *Physics) UpdateBounds(newMaxX, newMaxY float64) {
 
 // SetSpeed updates velocity magnitude while preserving current direction.
 func (p *Physics) SetSpeed(newSpeed float64) {
-	if newSpeed < 20 {
-		newSpeed = 20
-	}
-	if newSpeed > 4000 {
-		newSpeed = 4000
-	}
+	newSpeed = clamp(newSpeed, 20, 4000)
 	cur := math.Hypot(p.VX, p.VY)
 	if cur > 1e-6 {
 		scale := newSpeed / cur
@@ -178,32 +167,36 @@ func (p *Physics) Step(dt float64) BounceEvent {
 
 	// Reflect X if needed.
 	if hitLeft {
-		nx = -nx
 		if hitY {
 			nx = 0
+			p.VX = -p.VX
+		} else {
+			nx, p.VX = reflect1D(p.X, p.VX, p.MaxX, dt)
 		}
-		p.VX = -p.VX
 	} else if hitRight {
-		nx = 2*p.MaxX - nx
 		if hitY {
 			nx = p.MaxX
+			p.VX = -p.VX
+		} else {
+			nx, p.VX = reflect1D(p.X, p.VX, p.MaxX, dt)
 		}
-		p.VX = -p.VX
 	}
 
 	// Reflect Y if needed.
 	if hitTop {
-		ny = -ny
 		if hitX {
 			ny = 0
+			p.VY = -p.VY
+		} else {
+			ny, p.VY = reflect1D(p.Y, p.VY, p.MaxY, dt)
 		}
-		p.VY = -p.VY
 	} else if hitBottom {
-		ny = 2*p.MaxY - ny
 		if hitX {
 			ny = p.MaxY
+			p.VY = -p.VY
+		} else {
+			ny, p.VY = reflect1D(p.Y, p.VY, p.MaxY, dt)
 		}
-		p.VY = -p.VY
 	}
 
 	p.X = clamp(nx, 0, p.MaxX)
@@ -229,7 +222,7 @@ func (p *Physics) Step(dt float64) BounceEvent {
 
 		// Check tantalizing near-miss (within ~28px of a corner!) for optional HUD flavor.
 		nearThresh := math.Max(6.0, math.Min(28.0, math.Min(p.MaxX, p.MaxY)*0.045))
-		var missDist float64 = 1e9
+		missDist := 1e9
 		var cname string
 		if hitX {
 			if p.Y < nearThresh {
@@ -265,7 +258,6 @@ func (p *Physics) nextColor() {
 		p.ColorIdx = 0
 		return
 	}
-	// Pick a distinct vibrant color on every bounce.
 	offset := 1 + p.rng.Intn(p.NumColors-1)
 	p.ColorIdx = (p.ColorIdx + offset) % p.NumColors
 }
@@ -301,7 +293,6 @@ func (p *Physics) AimForCorner() {
 		sy = -1.0
 	}
 
-	// Distance to first wall in current X and Y directions.
 	dX0 := p.MaxX - p.X
 	if sx < 0 {
 		dX0 = p.X
@@ -330,7 +321,6 @@ func (p *Physics) AimForCorner() {
 				continue
 			}
 			diff := math.Abs(ang - curAngle)
-			// Slightly prefer 1-bounce shots over immediate 0-bounce turns unless already lined up (<3°).
 			if kx == 0 && ky == 0 && diff > 0.05 {
 				diff += 0.08
 			}
@@ -374,22 +364,19 @@ func (p *Physics) PredictNextCorner(maxBounces int) (float64, string, bool) {
 		isLeft := firstRight && (k%2 == 1) || (!firstRight && (k%2 == 0))
 		yAt, vyAt := reflect1D(p.Y, p.VY, p.MaxY, tx)
 
-		// Either Y is within CornerTol of top/bottom and approaching that wall at tx:
 		if yAt <= p.CornerTol && vyAt <= 0 {
 			return tx, cornerLabel(isLeft, true), true
 		}
 		if yAt >= p.MaxY-p.CornerTol && vyAt >= 0 {
 			return tx, cornerLabel(isLeft, false), true
 		}
-		// Or Y bounced JUST before tx such that X was within CornerTol of its wall at ty:
+
 		var dtSinceY float64
 		var hitTop bool
 		if vyAt > 0 {
-			// Just bounced off top wall (y=0)
 			dtSinceY = yAt / vyAbs
 			hitTop = true
 		} else {
-			// Just bounced off bottom wall (y=MaxY)
 			dtSinceY = (p.MaxY - yAt) / vyAbs
 			hitTop = false
 		}

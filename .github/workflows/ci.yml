@@ -13,12 +13,20 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
-      - run: go vet ./...
-      - run: go test -race -v ./...
+      - name: Check formatting
+        run: test -z "$(gofmt -s -l .)"
+      - name: Vet
+        run: go vet ./...
+      - name: Unit & race tests
+        run: go test -race -v ./...
+      - name: Benchmarks
+        run: go test -run=^$ -bench=. -benchmem ./...
       - name: Cross-build targets
         run: |
-          GOOS=darwin GOARCH=arm64 go build -o /dev/null .
-          GOOS=darwin GOARCH=amd64 go build -o /dev/null .
+          GOOS=darwin  GOARCH=arm64 go build -o /dev/null .
+          GOOS=darwin  GOARCH=amd64 go build -o /dev/null .
           GOOS=linux   GOARCH=amd64 go build -o /dev/null .
           GOOS=linux   GOARCH=arm64 go build -o /dev/null .
           GOOS=freebsd GOARCH=amd64 go build -o /dev/null .
+          GOOS=openbsd GOARCH=amd64 go build -o /dev/null .
+          GOOS=netbsd  GOARCH=amd64 go build -o /dev/null .
