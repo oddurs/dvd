@@ -21,11 +21,14 @@ func TestRasterizeDVDMaskGeometry(t *testing.T) {
 		t.Fatalf("unexpected mask dimensions: %dx%d", mask.Width, mask.Height)
 	}
 
-	// Disc body left of hole should be solid opaque.
+	// Disc body left of hole should be solid opaque (both Sample and Sample4x4).
 	discSolidX := int(math.Round(float64(W) * (35.0 / logoViewWidth)))
 	discY := int(math.Round(float64(H) * (61.5 / logoViewHeightVideo)))
 	if got := mask.Sample(discSolidX, discY); got < 240 {
 		t.Fatalf("expected solid disc pixel at (%d,%d), got alpha=%d", discSolidX, discY, got)
+	}
+	if got4 := mask.Sample4x4(discSolidX, discY); got4 < 240 {
+		t.Fatalf("expected solid 4x4 disc block at (%d,%d), got alpha=%d", discSolidX, discY, got4)
 	}
 
 	// Center hole inside elliptical disc should be cut out (alpha == 0) via even-odd rule.
@@ -79,6 +82,9 @@ func TestRasterizeDVDMaskGeometry(t *testing.T) {
 	if tiny.Sample(-1, 0) != 0 || tiny.Sample(99, 99) != 0 {
 		t.Fatalf("out-of-bounds Sample must return 0")
 	}
+	if tiny.Sample4x4(-8, 0) != 0 || tiny.Sample4x4(99, 99) != 0 {
+		t.Fatalf("out-of-bounds Sample4x4 must return 0")
+	}
 }
 
 func TestTintPaddedRGBAGeometry(t *testing.T) {
@@ -88,10 +94,11 @@ func TestTintPaddedRGBAGeometry(t *testing.T) {
 	if img.Bounds().Dx() != 120 || img.Bounds().Dy() != 75 {
 		t.Fatalf("unexpected padded bounds: %v", img.Bounds())
 	}
-	// Margin corners must remain fully transparent.
+	// Margin corners must remain fully transparent (A == 0) while carrying fringe-free RGB.
+	wantTransparent := color.NRGBA{R: col.R, G: col.G, B: col.B, A: 0}
 	for _, pt := range [][2]int{{0, 0}, {19, 14}, {119, 74}, {10, 70}} {
-		if got := img.NRGBAAt(pt[0], pt[1]); got != (color.NRGBA{}) {
-			t.Fatalf("expected transparent margin at %v, got %+v", pt, got)
+		if got := img.NRGBAAt(pt[0], pt[1]); got != wantTransparent {
+			t.Fatalf("expected bleed-free transparent margin at %v, got %+v", pt, got)
 		}
 	}
 	// Undersized canvas auto-expands so logo never clips.
@@ -101,7 +108,7 @@ func TestTintPaddedRGBAGeometry(t *testing.T) {
 	}
 }
 
-func TestKittyRendererChunkingPNGValidityAndPlacements(t *testing.T) {
+func TestKittyRendererChunkingPNGValidityAndSubpixelPlacements(t *testing.T) {
 	var out bytes.Buffer
 	kr := NewKittyRenderer(&out, true, false)
 
@@ -118,7 +125,7 @@ func TestKittyRendererChunkingPNGValidityAndPlacements(t *testing.T) {
 		t.Fatalf("expected UploadPalette to clear previous textures with d=A")
 	}
 
-	// Verify every APC payload chunk is <= 4096 bytes AND reassemble id=100 to verify valid PNG dimensions.
+	// Verify every APC payload chunk is <= 4096 bytes AND reassemble id=100 to verify 2x supersampled PNG dimensions.
 	parts := strings.Split(uploadStream, "\x1b_G")
 	var img100B64 strings.Builder
 	collecting100 := false
@@ -155,14 +162,14 @@ func TestKittyRendererChunkingPNGValidityAndPlacements(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transmitted image 100 is not a valid PNG: %v", err)
 	}
-	// texW = marginX(10) + cropW(250) = 260; texH = marginY(25) + cropH(160) = 185.
-	if decoded.Bounds().Dx() != 260 || decoded.Bounds().Dy() != 185 {
-		t.Fatalf("expected padded PNG dimensions 260x185, got %v", decoded.Bounds())
+	// At 2x subpixel scale: texW = marginX(20) + cropW(500) = 520; texH = marginY(50) + cropH(320) = 370.
+	if decoded.Bounds().Dx() != 520 || decoded.Bounds().Dy() != 370 {
+		t.Fatalf("expected 2x supersampled padded PNG dimensions 520x370, got %v", decoded.Bounds())
 	}
 
-	// Frame 1: place color 0 (id=100) at pixel (27, 45).
+	// Frame 1: place color 0 (id=100) at pixel (27.0, 45.0).
 	out.Reset()
-	if err := kr.DrawFrame(27, 45, 100, 40, 0, false, "bounces: 1  •  corners: 0"); err != nil {
+	if err := kr.DrawFrame(27.0, 45.0, 100, 40, 0, false, "bounces: 1  •  corners: 0"); err != nil {
 		t.Fatalf("DrawFrame failed: %v", err)
 	}
 	frame1 := out.String()
@@ -172,7 +179,7 @@ func TestKittyRendererChunkingPNGValidityAndPlacements(t *testing.T) {
 	if strings.Contains(frame1, "X=") || strings.Contains(frame1, "Y=") {
 		t.Fatalf("expected fixed-box crop placement without X=/Y= cell offsets: %q", frame1)
 	}
-	wantPut1 := "\x1b[3;3H\x1b_Ga=p,i=100,p=1,x=3,y=20,w=250,h=160,c=25,r=8,C=1,q=2\x1b\\"
+	wantPut1 := "\x1b[3;3H\x1b_Ga=p,i=100,p=1,x=6,y=40,w=500,h=320,c=25,r=8,z=-1,C=1,q=2\x1b\\"
 	if !strings.Contains(frame1, wantPut1) {
 		t.Fatalf("unexpected frame1 placement:\ngot:  %q\nwant: %q", frame1, wantPut1)
 	}
@@ -180,21 +187,36 @@ func TestKittyRendererChunkingPNGValidityAndPlacements(t *testing.T) {
 		t.Fatalf("expected blackBG HUD clear to preserve pitch-black SGR: %q", frame1)
 	}
 
-	// Frame 2: same color moved across cell boundary to (30, 46).
+	// Duplicate unchanged frame emits 0 bytes.
 	out.Reset()
-	_ = kr.DrawFrame(30, 46, 100, 40, 0, false, "")
+	_ = kr.DrawFrame(27.0, 45.0, 100, 40, 0, false, "bounces: 1  •  corners: 0")
+	if out.Len() != 0 {
+		t.Fatalf("expected unchanged Kitty frame to write 0 bytes, got %d", out.Len())
+	}
+
+	// Half-pixel sub-step (27.5, 45.5) shifts UV crop by 1 supersampled texel (x=5, y=39).
+	out.Reset()
+	_ = kr.DrawFrame(27.5, 45.5, 100, 40, 0, false, "")
+	wantHalf := "\x1b[3;3H\x1b_Ga=p,i=100,p=1,x=5,y=39,w=500,h=320,c=25,r=8,z=-1,C=1,q=2\x1b\\"
+	if !strings.Contains(out.String(), wantHalf) {
+		t.Fatalf("expected 0.5px sub-step placement:\ngot:  %q\nwant: %q", out.String(), wantHalf)
+	}
+
+	// Frame 2: same color moved across cell boundary to (30.0, 46.0).
+	out.Reset()
+	_ = kr.DrawFrame(30.0, 46.0, 100, 40, 0, false, "")
 	frame2 := out.String()
-	wantPut2 := "\x1b[3;4H\x1b_Ga=p,i=100,p=1,x=10,y=19,w=250,h=160,c=25,r=8,C=1,q=2\x1b\\"
+	wantPut2 := "\x1b[3;4H\x1b_Ga=p,i=100,p=1,x=20,y=38,w=500,h=320,c=25,r=8,z=-1,C=1,q=2\x1b\\"
 	if !strings.Contains(frame2, wantPut2) {
 		t.Fatalf("unexpected frame2 placement:\ngot:  %q\nwant: %q", frame2, wantPut2)
 	}
 
 	// Frame 3: bounce changes color to colorIdx=1 (id=101) at exact bottom-right wall (px=760, py=665).
 	out.Reset()
-	_ = kr.DrawFrame(760, 665, 100, 40, 1, false, "")
+	_ = kr.DrawFrame(760.0, 665.0, 100, 40, 1, false, "")
 	frame3 := out.String()
 	wantDel := "\x1b_Ga=d,d=i,i=100,p=1,q=2\x1b\\"
-	wantPut3 := "\x1b[33;76H\x1b_Ga=p,i=101,p=1,x=0,y=0,w=250,h=160,c=25,r=8,C=1,q=2\x1b\\"
+	wantPut3 := "\x1b[33;76H\x1b_Ga=p,i=101,p=1,x=0,y=0,w=500,h=320,c=25,r=8,z=-1,C=1,q=2\x1b\\"
 	if !strings.HasPrefix(frame3, "\x1b[?2026h") || !strings.HasSuffix(frame3, "\x1b[?2026l") {
 		t.Fatalf("expected synchronized output wrapper on frame3: %q", frame3)
 	}
@@ -204,7 +226,7 @@ func TestKittyRendererChunkingPNGValidityAndPlacements(t *testing.T) {
 
 	// Mid-resize safety: if cols temporarily shrinks below placeCols (cols=12 < 25), c clamps to 12.
 	out.Reset()
-	_ = kr.DrawFrame(50, 50, 12, 5, 1, true, "")
+	_ = kr.DrawFrame(50.0, 50.0, 12, 5, 1, true, "")
 	if !strings.Contains(out.String(), ",c=12,r=5,") {
 		t.Fatalf("expected mid-resize placement to clamp to 12x5, got %q", out.String())
 	}
@@ -242,7 +264,7 @@ func TestKittyRendererTmuxPassthrough(t *testing.T) {
 
 	// DrawFrame keeps pane-relative cursor CUP unwrapped while wrapping the Kitty placement in DCS.
 	out.Reset()
-	if err := kr.DrawFrame(25, 40, 80, 30, 0, false, ""); err != nil {
+	if err := kr.DrawFrame(25.0, 40.0, 80, 30, 0, false, ""); err != nil {
 		t.Fatalf("DrawFrame tmux failed: %v", err)
 	}
 	frame := out.String()
@@ -268,20 +290,27 @@ func TestKittyRendererFullViewportContinuitySweep(t *testing.T) {
 		t.Fatalf("UploadPalette: %v", err)
 	}
 
-	re := regexp.MustCompile(`\x1b\[(\d+);(\d+)H\x1b_Ga=p,i=\d+,p=1,x=(\d+),y=(\d+),w=(\d+),h=(\d+),c=(\d+),r=(\d+),C=1,q=2\x1b\\`)
-	maxPx := cols*cellW - logoW
-	maxPy := rows*cellH - logoH
+	re := regexp.MustCompile(`\x1b\[(\d+);(\d+)H\x1b_Ga=p,i=\d+,p=1,x=(\d+),y=(\d+),w=(\d+),h=(\d+),c=(\d+),r=(\d+),z=-1,C=1,q=2\x1b\\`)
+	maxTx := (cols*cellW - logoW) * kittySubpixelScale
+	maxTy := (rows*cellH - logoH) * kittySubpixelScale
+	sCellW := cellW * kittySubpixelScale
+	sCellH := cellH * kittySubpixelScale
 
-	// Sweep every single X pixel across the viewport and verify exact 1-pixel reconstruction and constant box.
-	for px := 0; px <= maxPx; px++ {
-		py := (px * maxPy) / maxPx
+	// Sweep every single 0.5-pixel sub-step across the viewport and verify exact reconstruction and constant box.
+	for tx := 0; tx <= maxTx; tx++ {
+		ty := (tx * maxTy) / maxTx
+		fx := float64(tx) / float64(kittySubpixelScale)
+		fy := float64(ty) / float64(kittySubpixelScale)
 		out.Reset()
-		if err := kr.DrawFrame(px, py, cols, rows, 0, false, ""); err != nil {
-			t.Fatalf("DrawFrame(%d,%d): %v", px, py, err)
+		if err := kr.DrawFrame(fx, fy, cols, rows, 0, false, ""); err != nil {
+			t.Fatalf("DrawFrame(%.1f,%.1f): %v", fx, fy, err)
+		}
+		if out.Len() == 0 {
+			continue
 		}
 		m := re.FindStringSubmatch(out.String())
 		if m == nil {
-			t.Fatalf("unexpected escape sequence at (%d,%d): %q", px, py, out.String())
+			t.Fatalf("unexpected escape sequence at (%.1f,%.1f): %q", fx, fy, out.String())
 		}
 		row1, _ := strconv.Atoi(m[1])
 		col1, _ := strconv.Atoi(m[2])
@@ -293,30 +322,30 @@ func TestKittyRendererFullViewportContinuitySweep(t *testing.T) {
 		r, _ := strconv.Atoi(m[8])
 
 		if c != kr.placeCols || r != kr.placeRows || w != kr.cropW || h != kr.cropH {
-			t.Fatalf("box mutated at (%d,%d): got (%d,%d,%d,%d)", px, py, c, r, w, h)
+			t.Fatalf("box mutated at (%.1f,%.1f): got (%d,%d,%d,%d)", fx, fy, c, r, w, h)
 		}
 		if col1 < 1 || col1+c-1 > cols {
-			t.Fatalf("column out of bounds at px=%d: col1=%d c=%d cols=%d", px, col1, c, cols)
+			t.Fatalf("column out of bounds at fx=%.1f: col1=%d c=%d cols=%d", fx, col1, c, cols)
 		}
 		if row1 < 1 || row1+r-1 > rows {
-			t.Fatalf("row out of bounds at py=%d: row1=%d r=%d rows=%d", py, row1, r, rows)
+			t.Fatalf("row out of bounds at fy=%.1f: row1=%d r=%d rows=%d", fy, row1, r, rows)
 		}
-		gotPx := (col1-1)*cellW + (kr.marginX - srcX)
-		gotPy := (row1-1)*cellH + (kr.marginY - srcY)
-		if gotPx != px || gotPy != py {
-			t.Fatalf("subpixel position mismatch: want (%d,%d), reconstructed (%d,%d)", px, py, gotPx, gotPy)
+		gotTx := (col1-1)*sCellW + (kr.marginX - srcX)
+		gotTy := (row1-1)*sCellH + (kr.marginY - srcY)
+		if gotTx != tx || gotTy != ty {
+			t.Fatalf("subpixel position mismatch: want (%d,%d), reconstructed (%d,%d)", tx, ty, gotTx, gotTy)
 		}
 	}
 }
 
-func TestANSIRendererModesSubRowBlackBGAndNoColor(t *testing.T) {
+func TestANSIRendererSubCellDifferentialEraseBlackBGAndNoColor(t *testing.T) {
 	var out bytes.Buffer
 	ar := NewANSIRenderer(&out, false, true, false)
 	ar.ResizeLogo(20, 6, true)
 
 	col := dvdPalette[0]
-	// Even half-row phase (oddHalf=0) spans 6 rows (rows 3..8).
-	if err := ar.DrawFrame(4, 2, 0, 60, 20, col, "bounces: 3  •  corners: 1"); err != nil {
+	// Aligned cell position (4.0, 2.0) spans 20x6 cells.
+	if err := ar.DrawFrame(4.0, 2.0, 60, 20, col, "bounces: 3  •  corners: 1"); err != nil {
 		t.Fatalf("DrawFrame failed: %v", err)
 	}
 	f1 := out.String()
@@ -326,30 +355,41 @@ func TestANSIRendererModesSubRowBlackBGAndNoColor(t *testing.T) {
 	if !strings.Contains(f1, "\x1b[48;2;0;0;0m") {
 		t.Fatalf("expected pitch-black background SGR when blackBG=true")
 	}
-	if ar.prevH != 6 {
-		t.Fatalf("expected prevH=6 on even half-step, got %d", ar.prevH)
+	if ar.prevW != 20 || ar.prevH != 6 {
+		t.Fatalf("expected aligned box 20x6, got %dx%d", ar.prevW, ar.prevH)
 	}
 
-	// Odd half-row phase (oddHalf=1) shifts by 0.5 row and spans 7 rows (rows 3..9).
+	// Duplicate unchanged sub-cell emits 0 bytes.
 	out.Reset()
-	_ = ar.DrawFrame(4, 2, 1, 60, 20, col, "")
-	if ar.prevH != 7 {
-		t.Fatalf("expected prevH=7 on odd half-step, got %d", ar.prevH)
+	_ = ar.DrawFrame(4.0, 2.0, 60, 20, col, "bounces: 3  •  corners: 1")
+	if out.Len() != 0 {
+		t.Fatalf("expected unchanged ANSI frame to emit 0 bytes, got %d", out.Len())
 	}
 
-	// Next frame erases all 7 rows of previous odd-phase box (including row 9) with blackBG preserved.
+	// Fractional sub-cell (4.25, 2.125) spans 21x7 cells cleanly.
 	out.Reset()
-	_ = ar.DrawFrame(6, 3, 0, 60, 20, col, "")
+	_ = ar.DrawFrame(4.25, 2.125, 60, 20, col, "")
+	if ar.prevW != 21 || ar.prevH != 7 {
+		t.Fatalf("expected fractional sub-cell box 21x7, got %dx%d", ar.prevW, ar.prevH)
+	}
+
+	// Moving down-right to (6.0, 3.0) erases trailing top row (row 3) and trailing left strip (cols 5..6)
+	// with blackBG preserved without blanking overlapping interior cells with full-width spaces.
+	out.Reset()
+	_ = ar.DrawFrame(6.0, 3.0, 60, 20, col, "")
 	f2 := out.String()
-	if !strings.Contains(f2, "\x1b[9;5H\x1b[0m\x1b[48;2;0;0;0m                    ") {
-		t.Fatalf("expected previous 7th odd-phase row (row 9) to be erased cleanly with blackBG")
+	if !strings.Contains(f2, "\x1b[3;5H\x1b[0m\x1b[48;2;0;0;0m                     ") {
+		t.Fatalf("expected differential erase of uncovered top row 3 (21 spaces) with blackBG")
+	}
+	if !strings.Contains(f2, "\x1b[4;5H\x1b[0m\x1b[48;2;0;0;0m  \x1b[") {
+		t.Fatalf("expected differential erase of uncovered 2-col left strip on row 4")
 	}
 
 	// ASCII + NO_COLOR strips all RGB TrueColor sequences.
 	out.Reset()
 	asciiNoCol := NewANSIRenderer(&out, true, true, true)
 	asciiNoCol.ResizeLogo(22, 9, true)
-	_ = asciiNoCol.DrawFrame(2, 1, 1, 50, 15, col, "bounces: 1")
+	_ = asciiNoCol.DrawFrame(2.0, 1.0, 50, 15, col, "bounces: 1")
 	f3 := out.String()
 	if strings.Contains(f3, "38;2;") || strings.Contains(f3, "48;2;") || strings.Contains(f3, "38;5;") {
 		t.Fatalf("expected NO_COLOR ASCII mode to emit zero color SGR codes, got %q", f3)
@@ -457,7 +497,7 @@ func TestPhysicsAimPredictAndCornerCelebration(t *testing.T) {
 			t.Fatalf("trial %d: expected PredictNextCorner to find upcoming corner after AimForCorner", trial)
 		}
 
-		const dt = 1.0 / 120.0
+		const dt = 1.0 / 240.0
 		maxSteps := int(math.Ceil((predSec+1.0)/dt)) + 10
 		hitAt := -1.0
 		var hitCorner string
@@ -511,8 +551,12 @@ func TestZeroAllocRenderHotPaths(t *testing.T) {
 		_ = kr.UploadPalette(320, 180, 16, 36, 120, 36, true, dvdPalette, cornerFlashColor)
 		hud := "bounces: 12  •  corners: 1  •  next corner: 9.4s (bottom-right)"
 
+		step := 0
 		kittyAllocs := testing.AllocsPerRun(200, func() {
-			_ = kr.DrawFrame(145, 210, 120, 36, 2, false, hud)
+			step++
+			fx := float64(step%400) * 0.5
+			fy := float64(step%300) * 0.5
+			_ = kr.DrawFrame(fx, fy, 120, 36, step%8, false, hud)
 		})
 		if kittyAllocs != 0 {
 			t.Fatalf("expected 0 allocs/frame in KittyRenderer.DrawFrame (tmux=%v), got %.1f", tmux, kittyAllocs)
@@ -522,12 +566,14 @@ func TestZeroAllocRenderHotPaths(t *testing.T) {
 	ar := NewANSIRenderer(io.Discard, false, true, false)
 	ar.ResizeLogo(24, 6, true)
 	hud := "bounces: 12  •  corners: 1  •  next corner: 9.4s (bottom-right)"
-	_ = ar.DrawFrame(5, 3, 1, 120, 36, dvdPalette[0], hud) // warm up internal buffer for oddHalf=1 span
+	_ = ar.DrawFrame(5.25, 3.125, 120, 36, dvdPalette[0], hud) // warm up internal buffer
 
-	phase := 0
+	step := 0
 	ansiAllocs := testing.AllocsPerRun(200, func() {
-		phase ^= 1
-		_ = ar.DrawFrame(6, 4, phase, 120, 36, dvdPalette[1], hud)
+		step++
+		colF := float64(step%160) * 0.25
+		rowF := float64(step%120) * 0.125
+		_ = ar.DrawFrame(colF, rowF, 120, 36, dvdPalette[step%8], hud)
 	})
 	if ansiAllocs != 0 {
 		t.Fatalf("expected 0 allocs/frame in ANSIRenderer.DrawFrame, got %.1f", ansiAllocs)
@@ -568,23 +614,31 @@ func BenchmarkRasterizeDVDMask(b *testing.B) {
 	}
 }
 
+func BenchmarkKittyUploadPalette(b *testing.B) {
+	kr := NewKittyRenderer(io.Discard, false, false)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = kr.UploadPalette(420, 237, 16, 36, 120, 36, true, dvdPalette, cornerFlashColor)
+	}
+}
+
 func BenchmarkKittyDrawFrame(b *testing.B) {
 	kr := NewKittyRenderer(io.Discard, false, false)
 	_ = kr.UploadPalette(420, 237, 16, 36, 120, 36, true, dvdPalette, cornerFlashColor)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = kr.DrawFrame(i%800, i%500, 120, 36, i%8, false, "bounces: 5  •  corners: 0")
+		_ = kr.DrawFrame(float64(i%1600)*0.5, float64(i%1000)*0.5, 120, 36, i%8, false, "bounces: 5  •  corners: 0")
 	}
 }
 
 func BenchmarkANSIDrawFrame(b *testing.B) {
 	ar := NewANSIRenderer(io.Discard, false, false, false)
 	ar.ResizeLogo(25, 6, true)
-	_ = ar.DrawFrame(0, 0, 1, 120, 36, dvdPalette[0], "")
+	_ = ar.DrawFrame(0.25, 0.125, 120, 36, dvdPalette[0], "")
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = ar.DrawFrame(i%80, i%25, i&1, 120, 36, dvdPalette[i%8], "bounces: 5  •  corners: 0")
+		_ = ar.DrawFrame(float64(i%320)*0.25, float64(i%200)*0.125, 120, 36, dvdPalette[i%8], "bounces: 5  •  corners: 0")
 	}
 }

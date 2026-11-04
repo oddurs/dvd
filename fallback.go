@@ -4,25 +4,32 @@ import (
 	"bytes"
 	"image/color"
 	"io"
+	"math"
 )
 
 // ANSIRenderer renders the vector DVD logo in terminals without Kitty graphics support,
-// using either sub-row TrueColor Unicode half-blocks (▀/▄) or classic retro ASCII art.
+// using either 4x4 sub-cell anti-aliased TrueColor Unicode half-blocks (▀/▄) or classic ASCII art.
 type ANSIRenderer struct {
-	out       io.Writer
-	mask      *LogoMask
-	colsW     int
-	rowsH     int
-	prevCol   int
-	prevRow   int
-	prevW     int
-	prevH     int
-	hasPrev   bool
-	asciiOnly bool
-	blackBG   bool
-	noColor   bool
-	buf       bytes.Buffer
-	spaces    []byte
+	out          io.Writer
+	mask         *LogoMask
+	colsW        int
+	rowsH        int
+	prevCol      int
+	prevRow      int
+	prevW        int
+	prevH        int
+	prevQX       int
+	prevQY       int
+	prevColor    color.RGBA
+	prevHUD      string
+	prevTermCols int
+	prevTermRows int
+	hasPrev      bool
+	asciiOnly    bool
+	blackBG      bool
+	noColor      bool
+	buf          bytes.Buffer
+	spaces       []byte
 }
 
 var pureASCIIArt = []string{
@@ -61,13 +68,14 @@ func (a *ANSIRenderer) ensureSpaces(n int) []byte {
 }
 
 func (a *ANSIRenderer) ResizeLogo(colsW, rowsH int, includeVideo bool) {
+	a.hasPrev = false
 	if a.asciiOnly {
 		a.colsW = len(pureASCIIArt[0])
 		a.rowsH = len(pureASCIIArt)
 		if !includeVideo {
 			a.rowsH--
 		}
-		a.ensureSpaces(a.colsW)
+		a.ensureSpaces(a.colsW + 1)
 		return
 	}
 	if colsW < 10 {
@@ -78,9 +86,9 @@ func (a *ANSIRenderer) ResizeLogo(colsW, rowsH int, includeVideo bool) {
 	}
 	a.colsW = colsW
 	a.rowsH = rowsH
-	a.ensureSpaces(colsW)
-	// Each terminal row encodes 2 vertical subpixels via half-block characters.
-	a.mask = RasterizeDVDMask(colsW, rowsH*2, includeVideo)
+	a.ensureSpaces(colsW + 1)
+	// 4 horizontal sub-samples per column x 8 vertical sub-samples per row (4x4 per half-block).
+	a.mask = RasterizeDVDMask(colsW*4, rowsH*8, includeVideo)
 }
 
 func (a *ANSIRenderer) LogoCells() (w, h int) {
@@ -89,9 +97,11 @@ func (a *ANSIRenderer) LogoCells() (w, h int) {
 
 func (a *ANSIRenderer) ResetPrev() {
 	a.hasPrev = false
+	a.prevHUD = ""
 }
 
 func (a *ANSIRenderer) ClearHUDLine(rows int) {
+	a.prevHUD = ""
 	if rows >= 1 {
 		a.buf.Reset()
 		a.buf.WriteString("\x1b[?2026h\x1b[")
@@ -103,49 +113,96 @@ func (a *ANSIRenderer) ClearHUDLine(rows int) {
 	}
 }
 
-// DrawFrame renders the logo at cell (col0, row0) with optional half-row vertical phase
-// oddHalf in {0, 1} so half-block mode steps smoothly by 0.5-row increments.
-func (a *ANSIRenderer) DrawFrame(col0, row0, oddHalf, termCols, termRows int, col color.RGBA, hud string) error {
+// DrawFrame renders the logo at fractional cell coordinates (colF, rowF).
+// In TrueColor half-block mode, positions are quantized to quarter-columns x eighth-rows
+// using 4x4 area-integrated sub-cell anti-aliasing and differential trail erasing.
+func (a *ANSIRenderer) DrawFrame(colF, rowF float64, termCols, termRows int, col color.RGBA, hud string) error {
 	if termCols < 1 || termRows < 1 {
 		return nil
 	}
-	if col0 < 0 {
-		col0 = 0
+	if colF < 0 {
+		colF = 0
 	}
-	if row0 < 0 {
-		row0 = 0
+	if rowF < 0 {
+		rowF = 0
 	}
-	if a.asciiOnly || oddHalf <= 0 {
-		oddHalf = 0
+
+	var qx, qy, col0, row0, remX, remY, spanCols, spanRows int
+	if a.asciiOnly {
+		col0 = int(math.Round(colF))
+		row0 = int(math.Round(rowF))
+		qx, qy = col0, row0
+		spanCols = a.colsW
+		spanRows = a.rowsH
 	} else {
-		oddHalf = 1
+		qx = int(math.Round(colF * 4.0))
+		qy = int(math.Round(rowF * 8.0))
+		col0 = qx / 4
+		remX = qx & 3
+		row0 = qy / 8
+		remY = qy & 7
+		spanCols = a.colsW
+		if remX > 0 {
+			spanCols++
+		}
+		spanRows = a.rowsH
+		if remY > 0 {
+			spanRows++
+		}
+	}
+
+	if hud != "" && termRows >= 2 && termCols > 4 {
+		hud = truncateRunes(hud, termCols-2)
+	} else {
+		hud = ""
+	}
+
+	if a.hasPrev && qx == a.prevQX && qy == a.prevQY &&
+		col == a.prevColor && hud == a.prevHUD &&
+		termCols == a.prevTermCols && termRows == a.prevTermRows {
+		return nil
 	}
 
 	rst := a.resetSGR()
 	a.buf.Reset()
 	a.buf.WriteString("\x1b[?2026h")
 
-	// Erase previous bounding box so no trails remain.
+	// Differential erase: clear only cells of the previous box that lie outside the new box,
+	// avoiding blank-flash shimmer even in terminals without ?2026h synchronized output.
 	if a.hasPrev {
-		for r := 0; r < a.prevH; r++ {
-			ry := a.prevRow + r + 1
-			if ry < 1 || ry > termRows {
-				continue
-			}
-			cx := max(1, a.prevCol+1)
-			w := a.prevW
-			if cx+w-1 > termCols {
-				w = termCols - cx + 1
-			}
-			if w > 0 {
-				writeCup(&a.buf, ry, cx)
-				a.buf.WriteString(rst)
-				a.buf.Write(a.ensureSpaces(w))
+		pL := max(0, a.prevCol)
+		pR := min(termCols, a.prevCol+a.prevW)
+		cL := max(0, col0)
+		cR := min(termCols, col0+spanCols)
+		if pR > pL {
+			for pr := a.prevRow; pr < a.prevRow+a.prevH; pr++ {
+				ry := pr + 1
+				if ry < 1 || ry > termRows {
+					continue
+				}
+				if pr < row0 || pr >= row0+spanRows || cL >= pR || cR <= pL {
+					writeCup(&a.buf, ry, pL+1)
+					a.buf.WriteString(rst)
+					a.buf.Write(a.ensureSpaces(pR - pL))
+					continue
+				}
+				if pL < cL {
+					w := min(pR, cL) - pL
+					writeCup(&a.buf, ry, pL+1)
+					a.buf.WriteString(rst)
+					a.buf.Write(a.ensureSpaces(w))
+				}
+				if pR > cR {
+					start := max(pL, cR)
+					w := pR - start
+					writeCup(&a.buf, ry, start+1)
+					a.buf.WriteString(rst)
+					a.buf.Write(a.ensureSpaces(w))
+				}
 			}
 		}
 	}
 
-	spanRows := a.rowsH
 	if a.asciiOnly {
 		if a.noColor {
 			a.buf.WriteString("\x1b[1m")
@@ -175,31 +232,35 @@ func (a *ANSIRenderer) DrawFrame(col0, row0, oddHalf, termCols, termRows int, co
 		}
 		a.buf.WriteString(rst)
 	} else if a.mask != nil {
-		spanRows = a.rowsH + oddHalf
 		for r := 0; r < spanRows; r++ {
 			ry := row0 + r + 1
 			if ry < 1 || ry > termRows {
 				continue
 			}
 			writeCup(&a.buf, ry, col0+1)
-			for c := 0; c < a.colsW; c++ {
+			yTop := r*8 - remY
+			yBot := yTop + 4
+			for c := 0; c < spanCols; c++ {
 				if col0+c >= termCols {
 					break
 				}
-				topA := a.mask.Sample(c, r*2-oddHalf)
-				botA := a.mask.Sample(c, r*2+1-oddHalf)
-				if topA < 32 && botA < 32 {
+				x0 := c*4 - remX
+				topA := a.mask.Sample4x4(x0, yTop)
+				botA := a.mask.Sample4x4(x0, yBot)
+				if topA < 10 && botA < 10 {
 					a.buf.WriteString(rst)
 					a.buf.WriteByte(' ')
 					continue
 				}
 				if a.noColor {
-					if topA >= 32 && botA < 32 {
+					if topA >= 64 && botA < 64 {
 						a.buf.WriteString("▀")
-					} else if topA < 32 && botA >= 32 {
+					} else if topA < 64 && botA >= 64 {
 						a.buf.WriteString("▄")
-					} else {
+					} else if topA >= 64 && botA >= 64 {
 						a.buf.WriteString("█")
+					} else {
+						a.buf.WriteByte(' ')
 					}
 					continue
 				}
@@ -209,12 +270,12 @@ func (a *ANSIRenderer) DrawFrame(col0, row0, oddHalf, termCols, termRows int, co
 				br := uint8((uint16(col.R) * uint16(botA)) / 255)
 				bg := uint8((uint16(col.G) * uint16(botA)) / 255)
 				bb := uint8((uint16(col.B) * uint16(botA)) / 255)
-				if topA >= 32 && botA < 32 {
+				if topA >= 10 && botA < 10 {
 					a.buf.WriteString(rst)
 					a.buf.WriteString("\x1b[38;2;")
 					writeRGB(&a.buf, tr, tg, tb)
 					a.buf.WriteString("m▀")
-				} else if topA < 32 && botA >= 32 {
+				} else if topA < 10 && botA >= 10 {
 					a.buf.WriteString(rst)
 					a.buf.WriteString("\x1b[38;2;")
 					writeRGB(&a.buf, br, bg, bb)
@@ -231,8 +292,7 @@ func (a *ANSIRenderer) DrawFrame(col0, row0, oddHalf, termCols, termRows int, co
 		}
 	}
 
-	if hud != "" && termRows >= 2 && termCols > 4 {
-		hud = truncateRunes(hud, termCols-2)
+	if hud != "" {
 		writeCup(&a.buf, termRows, 1)
 		a.buf.WriteString(rst)
 		if !a.noColor {
@@ -248,8 +308,14 @@ func (a *ANSIRenderer) DrawFrame(col0, row0, oddHalf, termCols, termRows int, co
 
 	a.prevCol = col0
 	a.prevRow = row0
-	a.prevW = a.colsW
+	a.prevW = spanCols
 	a.prevH = spanRows
+	a.prevQX = qx
+	a.prevQY = qy
+	a.prevColor = col
+	a.prevHUD = hud
+	a.prevTermCols = termCols
+	a.prevTermRows = termRows
 	a.hasPrev = true
 
 	_, err := a.out.Write(a.buf.Bytes())

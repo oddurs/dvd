@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const defaultVersion = "v0.3.0"
+const defaultVersion = "v0.4.0"
 
 var version = ""
 
@@ -63,7 +63,7 @@ type Config struct {
 func main() {
 	var cfg Config
 	flag.StringVar(&cfg.ModeFlag, "mode", "auto", "render mode: auto, kitty, ansi, or ascii")
-	flag.IntVar(&cfg.FPS, "fps", 60, "target frames per second (15..240)")
+	flag.IntVar(&cfg.FPS, "fps", 240, "target frames per second (15..360)")
 	flag.Float64Var(&cfg.SpeedMult, "speed", 1.0, "movement speed multiplier (e.g. 0.5, 1.0, 2.0)")
 	flag.Float64Var(&cfg.Scale, "scale", 0.21, "logo width as fraction of screen width (0.06..0.60)")
 	flag.BoolVar(&cfg.ShowStats, "stats", false, "show bottom status bar (bounces, corners, next corner ETA)")
@@ -106,7 +106,7 @@ func main() {
 		return
 	}
 
-	cfg.FPS = min(max(15, cfg.FPS), 240)
+	cfg.FPS = min(max(15, cfg.FPS), 360)
 	cfg.Scale = clamp(cfg.Scale, 0.06, 0.60)
 	cfg.SpeedMult = clamp(cfg.SpeedMult, 0.05, 10.0)
 
@@ -206,6 +206,8 @@ func runScreensaver(cfg Config) error {
 
 	paused := false
 	frameDur := time.Second / time.Duration(cfg.FPS)
+	targetDT := 1.0 / float64(cfg.FPS)
+	smoothedDT := targetDT
 	ticker := time.NewTicker(frameDur)
 	defer ticker.Stop()
 
@@ -249,30 +251,17 @@ func runScreensaver(cfg Config) error {
 		colorIdx, flash := phys.ActiveDisplayColor()
 		switch mode {
 		case ModeKitty:
-			px := int(math.Round(phys.X))
-			py := int(math.Round(phys.Y))
-			_ = kitty.DrawFrame(px, py, metrics.Cols, metrics.Rows, colorIdx, flash, hud)
-		case ModeANSI:
+			_ = kitty.DrawFrame(phys.X, phys.Y, metrics.Cols, metrics.Rows, colorIdx, flash, hud)
+		case ModeANSI, ModeASCII:
 			col := dvdPalette[colorIdx%len(dvdPalette)]
 			if flash {
 				col = cornerFlashColor
 			}
 			uRows := usableRowsFor(metrics.Rows)
 			lw, lh := ansi.LogoCells()
-			c0 := min(max(0, int(math.Round(phys.X/float64(max(1, metrics.CellW))))), max(0, metrics.Cols-lw))
-			maxHalfY := max(0, 2*(uRows-lh))
-			halfY := min(max(0, int(math.Round(phys.Y*2.0/float64(max(1, metrics.CellH))))), maxHalfY)
-			_ = ansi.DrawFrame(c0, halfY/2, halfY&1, metrics.Cols, metrics.Rows, col, hud)
-		case ModeASCII:
-			col := dvdPalette[colorIdx%len(dvdPalette)]
-			if flash {
-				col = cornerFlashColor
-			}
-			uRows := usableRowsFor(metrics.Rows)
-			lw, lh := ansi.LogoCells()
-			c0 := min(max(0, int(math.Round(phys.X/float64(max(1, metrics.CellW))))), max(0, metrics.Cols-lw))
-			r0 := min(max(0, int(math.Round(phys.Y/float64(max(1, metrics.CellH))))), max(0, uRows-lh))
-			_ = ansi.DrawFrame(c0, r0, 0, metrics.Cols, metrics.Rows, col, hud)
+			colF := clamp(phys.X/float64(max(1, metrics.CellW)), 0, float64(max(0, metrics.Cols-lw)))
+			rowF := clamp(phys.Y/float64(max(1, metrics.CellH)), 0, float64(max(0, uRows-lh)))
+			_ = ansi.DrawFrame(colF, rowF, metrics.Cols, metrics.Rows, col, hud)
 		}
 	}
 
@@ -313,6 +302,7 @@ func runScreensaver(cfg Config) error {
 		metrics = QueryMetrics(int(ttyOut.Fd()), csiCellW, csiCellH)
 		reconfigure(true)
 		lastTick = time.Now()
+		smoothedDT = targetDT
 	}
 
 	// Debounce timer so live window drag-resizing stays silky smooth and re-rasterizes textures once settled.
@@ -435,6 +425,7 @@ func runScreensaver(cfg Config) error {
 			case ActionTogglePause:
 				paused = !paused
 				lastTick = time.Now()
+				smoothedDT = targetDT
 				renderFrame(lastTick)
 			case ActionAimCorner:
 				phys.AimForCorner()
@@ -480,11 +471,19 @@ func runScreensaver(cfg Config) error {
 			}
 
 		case now := <-ticker.C:
-			dt := now.Sub(lastTick).Seconds()
+			rawDT := now.Sub(lastTick).Seconds()
 			lastTick = now
 
 			if !paused {
-				stepEv := phys.Step(dt)
+				// Filter wakeup phase jitter during steady-state ticks while preserving exact speed on real hitches.
+				stepDT := rawDT
+				if rawDT >= 0.4*targetDT && rawDT <= 2.2*targetDT {
+					smoothedDT += (rawDT - smoothedDT) * 0.08
+					stepDT = smoothedDT
+				} else if rawDT > 2.2*targetDT {
+					smoothedDT = targetDT
+				}
+				stepEv := phys.Step(stepDT)
 				if stepEv.BouncedWall {
 					lastETACalc = time.Time{}
 				}

@@ -25,17 +25,17 @@ go install .
 ## Usage
 
 ```sh
-dvd                  # run at 60 FPS (auto-detects Kitty graphics)
+dvd                  # run at 240 FPS sub-pixel precision (auto-detects Kitty graphics)
 dvd -x               # screensaver mode: exit on any key or mouse movement
 dvd -stats           # show bounce counter & next-corner countdown
-dvd -fps 120 -black  # 120 FPS on pitch-black background
+dvd -black           # force opaque pitch-black background
 ```
 
 ### Flags
 
 ```text
   -mode string   render mode: auto, kitty, ansi, or ascii (default "auto")
-  -fps int       target frames per second, 15..240 (default 60)
+  -fps int       target frames per second, 15..360 (default 240)
   -speed float   movement speed multiplier (default 1.0)
   -scale float   logo width as fraction of screen width, 0.06..0.60 (default 0.21)
   -stats         show bottom status bar (bounces, corners, next corner ETA)
@@ -67,7 +67,7 @@ Respects [`NO_COLOR`](https://no-color.org/) and `tmux` DCS passthrough (`set -g
 
 ## How It Works
 
-At startup, `dvd` probes Kitty Graphics Protocol support and cell pixel dimensions (`TIOCGWINSZ` / Win32 console metrics, `CSI 16t`, `CSI 14t`), rasterizes the **DVD Video** SVG paths with 8×8 supersampled scanline anti-aliasing, and uploads padded palette textures to terminal GPU memory (`a=t,f=100`). Each frame updates a constant `(c, r)` cell box using a sliding source crop (`x, y, w, h`) wrapped in synchronized output (`?2026h`) with zero heap allocations per frame, yielding tear-free single-pixel diagonal motion without cell-boundary stretching.
+At startup, `dvd` probes Kitty Graphics Protocol support and cell pixel dimensions (`TIOCGWINSZ` / Win32 console metrics, `CSI 16t`, `CSI 14t`), rasterizes the **DVD Video** SVG paths at 2× sub-pixel density with 8×8 supersampled scanline anti-aliasing, and uploads padded palette textures in parallel to terminal GPU memory (`a=t,f=100`). Each frame updates a constant `(c, r)` cell box using a half-pixel sliding source crop (`x, y, w, h`) wrapped in synchronized output (`?2026h`) at 240 Hz with EMA timestep smoothing and zero heap allocations per frame, yielding tear-free sub-pixel motion on 60–240 Hz displays without cell-boundary stretching.
 
 ## License
 

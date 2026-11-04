@@ -215,6 +215,8 @@ func (m *LogoMask) TintRGBA(col color.RGBA) *image.NRGBA {
 }
 
 // TintPaddedRGBA renders the tinted mask at (offsetX, offsetY) inside a transparent texW x texH canvas.
+// All pixels (including alpha=0 margins) carry (col.R, col.G, col.B) so GPU hardware bilinear
+// filtering never bleeds dark fringes at sub-pixel offsets and PNG row predictors see constant RGB.
 func (m *LogoMask) TintPaddedRGBA(col color.RGBA, texW, texH, offsetX, offsetY int) *image.NRGBA {
 	if offsetX < 0 {
 		offsetX = 0
@@ -231,6 +233,21 @@ func (m *LogoMask) TintPaddedRGBA(col color.RGBA, texW, texH, offsetX, offsetY i
 	img := image.NewNRGBA(image.Rect(0, 0, texW, texH))
 	pix := img.Pix
 	stride := img.Stride
+
+	if len(pix) >= 4 {
+		for x := 0; x < texW; x++ {
+			off := x * 4
+			pix[off+0] = col.R
+			pix[off+1] = col.G
+			pix[off+2] = col.B
+			pix[off+3] = 0
+		}
+		for filled := stride; filled < len(pix); filled *= 2 {
+			copy(pix[filled:], pix[:filled])
+		}
+	}
+
+	colA := uint16(col.A)
 	for y := 0; y < m.Height; y++ {
 		srcRow := y * m.Width
 		dstRow := (y+offsetY)*stride + offsetX*4
@@ -239,11 +256,7 @@ func (m *LogoMask) TintPaddedRGBA(col color.RGBA, texW, texH, offsetX, offsetY i
 			if a == 0 {
 				continue
 			}
-			off := dstRow + x*4
-			pix[off+0] = col.R
-			pix[off+1] = col.G
-			pix[off+2] = col.B
-			pix[off+3] = uint8((uint16(a) * uint16(col.A)) / 255)
+			pix[dstRow+x*4+3] = uint8((uint16(a) * colA) / 255)
 		}
 	}
 	return img
@@ -255,6 +268,41 @@ func (m *LogoMask) Sample(x, y int) uint8 {
 		return 0
 	}
 	return m.Alpha[y*m.Width+x]
+}
+
+// Sample4x4 returns the area-averaged alpha (0..255) of the 4x4 texel block [x0..x0+4, y0..y0+4).
+func (m *LogoMask) Sample4x4(x0, y0 int) uint8 {
+	if x0+4 <= 0 || x0 >= m.Width || y0+4 <= 0 || y0 >= m.Height {
+		return 0
+	}
+	var sum uint32
+	if x0 >= 0 && x0+4 <= m.Width && y0 >= 0 && y0+4 <= m.Height {
+		w := m.Width
+		r0 := y0*w + x0
+		r1 := r0 + w
+		r2 := r1 + w
+		r3 := r2 + w
+		a := m.Alpha
+		sum = uint32(a[r0]) + uint32(a[r0+1]) + uint32(a[r0+2]) + uint32(a[r0+3]) +
+			uint32(a[r1]) + uint32(a[r1+1]) + uint32(a[r1+2]) + uint32(a[r1+3]) +
+			uint32(a[r2]) + uint32(a[r2+1]) + uint32(a[r2+2]) + uint32(a[r2+3]) +
+			uint32(a[r3]) + uint32(a[r3+1]) + uint32(a[r3+2]) + uint32(a[r3+3])
+		return uint8((sum + 8) >> 4)
+	}
+	for dy := 0; dy < 4; dy++ {
+		yy := y0 + dy
+		if yy < 0 || yy >= m.Height {
+			continue
+		}
+		row := yy * m.Width
+		for dx := 0; dx < 4; dx++ {
+			xx := x0 + dx
+			if xx >= 0 && xx < m.Width {
+				sum += uint32(m.Alpha[row+xx])
+			}
+		}
+	}
+	return uint8((sum + 8) >> 4)
 }
 
 // parseSVGPolygons flattens SVG path commands (M, L, H, V, C, S, Z) into closed polylines.

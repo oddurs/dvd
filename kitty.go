@@ -7,37 +7,47 @@ import (
 	"image/color"
 	"image/png"
 	"io"
+	"math"
 	"strconv"
+	"sync"
 )
 
-const kittyPlacementID = 1
+const (
+	kittyPlacementID   = 1
+	kittySubpixelScale = 2 // 2x2 texels per physical pixel -> 0.5px bilinear UV sub-stepping
+)
 
 type pngBufPool struct {
-	buf *png.EncoderBuffer
+	mu   sync.Mutex
+	bufs []*png.EncoderBuffer
 }
 
 func (p *pngBufPool) Get() *png.EncoderBuffer {
-	b := p.buf
-	p.buf = nil
-	if b == nil {
+	p.mu.Lock()
+	n := len(p.bufs)
+	if n == 0 {
+		p.mu.Unlock()
 		return &png.EncoderBuffer{}
 	}
+	b := p.bufs[n-1]
+	p.bufs = p.bufs[:n-1]
+	p.mu.Unlock()
 	return b
 }
 
 func (p *pngBufPool) Put(b *png.EncoderBuffer) {
-	p.buf = b
+	p.mu.Lock()
+	p.bufs = append(p.bufs, b)
+	p.mu.Unlock()
 }
 
-// KittyRenderer manages GPU-cached logo textures and sub-cell smooth placements
+// KittyRenderer manages GPU-cached supersampled logo textures and sub-pixel smooth placements
 // using the Kitty Graphics Protocol (directly or wrapped in tmux DCS passthrough).
 //
-// Instead of relying on X=/Y= cell offsets (which cause cell-span rounding "jelly"
-// stretching in some renderers or snap jumps when reported cell pixel sizes differ
-// by DPI scale), each texture is padded with a transparent margin and displayed into
-// a FIXED (c x r) cell box via source-rectangle cropping (x, y, w, h).
-// That keeps the rendered cell box 100% constant while sliding smoothly pixel-by-pixel
-// across cell boundaries.
+// Each texture is rasterized at 2x sub-pixel density inside a padded transparent margin and
+// displayed into a FIXED (c x r) cell box via source-rectangle cropping (x, y, w, h).
+// That keeps the rendered cell box 100% constant (zero jelly stretching) while sliding smoothly
+// in half-pixel GPU bilinear increments across cell boundaries.
 type KittyRenderer struct {
 	out             io.Writer
 	blackBG         bool
@@ -46,16 +56,22 @@ type KittyRenderer struct {
 	colorIDs        []uint32
 	flashID         uint32
 	activeImgID     uint32
-	logoW, logoH    int
-	cellW, cellH    int
+	logoW, logoH    int // viewport pixel dimensions
+	cellW, cellH    int // viewport cell pixel dimensions
 	placeCols       int
 	placeRows       int
-	cropW, cropH    int
-	marginX         int
-	marginY         int
+	cropW, cropH    int // in supersampled texels (kittySubpixelScale * px)
+	marginX         int // in supersampled texels
+	marginY         int // in supersampled texels
+	hasPrev         bool
+	prevCol0        int
+	prevRow0        int
+	prevSrcX        int
+	prevSrcY        int
+	prevW, prevH    int
+	prevC, prevR    int
+	prevHUD         string
 	buf             bytes.Buffer
-	pngBuf          bytes.Buffer
-	b64Buf          []byte
 	pngPool         pngBufPool
 }
 
@@ -91,8 +107,9 @@ func (k *KittyRenderer) resetSGR() string {
 	return "\x1b[0m"
 }
 
-// UploadPalette rasterizes the vector DVD logo at (logoW x logoH) pixels inside a padded
-// transparent atlas aligned to (cellW, cellH), and uploads each palette color + flash frame.
+// UploadPalette rasterizes the vector DVD logo at 2x supersampled texel density inside a padded
+// transparent atlas aligned to (cellW, cellH), encodes all palette PNGs in parallel, and uploads
+// them to terminal GPU memory.
 func (k *KittyRenderer) UploadPalette(
 	logoW, logoH, cellW, cellH, termCols, termRows int,
 	includeVideo bool,
@@ -124,16 +141,46 @@ func (k *KittyRenderer) UploadPalette(
 		logoH = 4
 	}
 
-	logoCols := (logoW + cellW - 1) / cellW
-	logoRows := (logoH + cellH - 1) / cellH
+	sLogoW := logoW * kittySubpixelScale
+	sLogoH := logoH * kittySubpixelScale
+	sCellW := cellW * kittySubpixelScale
+	sCellH := cellH * kittySubpixelScale
+
+	logoCols := (sLogoW + sCellW - 1) / sCellW
+	logoRows := (sLogoH + sCellH - 1) / sCellH
 	placeCols := min(termCols, logoCols+1)
 	placeRows := min(termRows, logoRows+1)
-	cropW := max(logoW, placeCols*cellW)
-	cropH := max(logoH, placeRows*cellH)
-	marginX := cropW - logoW
-	marginY := cropH - logoH
+	cropW := max(sLogoW, placeCols*sCellW)
+	cropH := max(sLogoH, placeRows*sCellH)
+	marginX := cropW - sLogoW
+	marginY := cropH - sLogoH
 	texW := marginX + cropW
 	texH := marginY + cropH
+
+	mask := RasterizeDVDMask(sLogoW, sLogoH, includeVideo)
+	base := k.nextBaseID
+	k.nextBaseID += uint32(len(palette) + 8)
+
+	total := len(palette) + 1
+	b64Payloads := make([][]byte, total)
+	errs := make([]error, total)
+
+	var wg sync.WaitGroup
+	wg.Add(total)
+	for i := 0; i < total; i++ {
+		col := flash
+		if i < len(palette) {
+			col = palette[i]
+		}
+		go func(idx int, c color.RGBA) {
+			defer wg.Done()
+			img := mask.TintPaddedRGBA(c, texW, texH, marginX, marginY)
+			b64, err := k.encodePNGToBase64(img)
+			b64Payloads[idx] = b64
+			errs[idx] = err
+		}(i, col)
+	}
+	wg.Wait()
 
 	k.buf.Reset()
 	k.buf.WriteString("\x1b[?2026h")
@@ -142,27 +189,26 @@ func (k *KittyRenderer) UploadPalette(
 	k.buf.WriteString("a=d,d=A,q=2")
 	k.writeAPCEnd()
 
-	mask := RasterizeDVDMask(logoW, logoH, includeVideo)
-	base := k.nextBaseID
-	k.nextBaseID += uint32(len(palette) + 8)
-
 	k.colorIDs = k.colorIDs[:0]
-	for i, col := range palette {
-		id := base + uint32(i)
-		img := mask.TintPaddedRGBA(col, texW, texH, marginX, marginY)
-		if err := k.encodeKittyPNG(id, img); err != nil {
-			return err
+	for i := 0; i < len(palette); i++ {
+		if errs[i] != nil {
+			return errs[i]
 		}
+		id := base + uint32(i)
+		k.writeBase64Chunks(id, b64Payloads[i])
 		k.colorIDs = append(k.colorIDs, id)
 	}
 
-	k.flashID = base + uint32(len(palette))
-	if err := k.encodeKittyPNG(k.flashID, mask.TintPaddedRGBA(flash, texW, texH, marginX, marginY)); err != nil {
-		return err
+	if errs[len(palette)] != nil {
+		return errs[len(palette)]
 	}
+	k.flashID = base + uint32(len(palette))
+	k.writeBase64Chunks(k.flashID, b64Payloads[len(palette)])
 
 	k.buf.WriteString("\x1b[?2026l")
 	k.activeImgID = 0
+	k.hasPrev = false
+	k.prevHUD = ""
 	k.logoW = logoW
 	k.logoH = logoH
 	k.cellW = cellW
@@ -178,32 +224,36 @@ func (k *KittyRenderer) UploadPalette(
 	return err
 }
 
-// DrawFrame positions the requested palette image at exact pixel coordinates (px, py)
-// using a constant (c x r) cell box and sliding source-crop (x, y, w, h) so the logo
-// never stretches or jitters across cell boundaries.
-func (k *KittyRenderer) DrawFrame(px, py, cols, rows int, colorIdx int, useFlash bool, hud string) error {
+// DrawFrame positions the requested palette image at floating-point pixel coordinates (fx, fy)
+// quantized to half-pixel supersampled UV increments inside a constant (c x r) cell box.
+func (k *KittyRenderer) DrawFrame(fx, fy float64, cols, rows int, colorIdx int, useFlash bool, hud string) error {
 	if len(k.colorIDs) == 0 || k.cellW < 1 || k.cellH < 1 || cols < 1 || rows < 1 {
 		return nil
 	}
 
+	sCellW := k.cellW * kittySubpixelScale
+	sCellH := k.cellH * kittySubpixelScale
+	sLogoW := k.logoW * kittySubpixelScale
+	sLogoH := k.logoH * kittySubpixelScale
+
 	c := min(k.placeCols, cols)
 	r := min(k.placeRows, rows)
-	w := min(k.cropW, c*k.cellW)
-	h := min(k.cropH, r*k.cellH)
+	w := min(k.cropW, c*sCellW)
+	h := min(k.cropH, r*sCellH)
 
-	maxPx := max(0, cols*k.cellW-k.logoW)
-	maxPy := max(0, rows*k.cellH-k.logoH)
-	px = min(max(0, px), maxPx)
-	py = min(max(0, py), maxPy)
+	maxTx := max(0, cols*sCellW-sLogoW)
+	maxTy := max(0, rows*sCellH-sLogoH)
+	tx := min(max(0, int(math.Round(fx*kittySubpixelScale))), maxTx)
+	ty := min(max(0, int(math.Round(fy*kittySubpixelScale))), maxTy)
 
 	maxCol0 := max(0, cols-c)
 	maxRow0 := max(0, rows-r)
 
-	col0 := min(px/k.cellW, maxCol0)
-	row0 := min(py/k.cellH, maxRow0)
+	col0 := min(tx/sCellW, maxCol0)
+	row0 := min(ty/sCellH, maxRow0)
 
-	subX := min(max(0, px-col0*k.cellW), k.marginX)
-	subY := min(max(0, py-row0*k.cellH), k.marginY)
+	subX := min(max(0, tx-col0*sCellW), k.marginX)
+	subY := min(max(0, ty-row0*sCellH), k.marginY)
 
 	srcX := k.marginX - subX
 	srcY := k.marginY - subY
@@ -211,6 +261,21 @@ func (k *KittyRenderer) DrawFrame(px, py, cols, rows int, colorIdx int, useFlash
 	targetID := k.colorIDs[((colorIdx%len(k.colorIDs))+len(k.colorIDs))%len(k.colorIDs)]
 	if useFlash {
 		targetID = k.flashID
+	}
+
+	if hud != "" && rows >= 2 && cols > 4 {
+		hud = truncateRunes(hud, cols-2)
+	} else {
+		hud = ""
+	}
+
+	if k.hasPrev && k.activeImgID == targetID &&
+		col0 == k.prevCol0 && row0 == k.prevRow0 &&
+		srcX == k.prevSrcX && srcY == k.prevSrcY &&
+		w == k.prevW && h == k.prevH &&
+		c == k.prevC && r == k.prevR &&
+		hud == k.prevHUD {
+		return nil
 	}
 
 	k.buf.Reset()
@@ -225,7 +290,7 @@ func (k *KittyRenderer) DrawFrame(px, py, cols, rows int, colorIdx int, useFlash
 		k.writeAPCEnd()
 	}
 
-	// Anchor cell (1-indexed) + fixed c/r cell span + source rectangle crop (x,y,w,h).
+	// Anchor cell (1-indexed) + fixed c/r cell span + source rectangle crop (x,y,w,h) behind text (z=-1).
 	k.buf.WriteString("\x1b[")
 	writeUint(&k.buf, uint64(row0+1))
 	k.buf.WriteByte(';')
@@ -249,11 +314,10 @@ func (k *KittyRenderer) DrawFrame(px, py, cols, rows int, colorIdx int, useFlash
 	writeUint(&k.buf, uint64(c))
 	k.buf.WriteString(",r=")
 	writeUint(&k.buf, uint64(r))
-	k.buf.WriteString(",C=1,q=2")
+	k.buf.WriteString(",z=-1,C=1,q=2")
 	k.writeAPCEnd()
 
-	if hud != "" && rows >= 2 && cols > 4 {
-		hud = truncateRunes(hud, cols-2)
+	if hud != "" {
 		k.buf.WriteString("\x1b[")
 		writeUint(&k.buf, uint64(rows))
 		k.buf.WriteString(";1H")
@@ -265,6 +329,16 @@ func (k *KittyRenderer) DrawFrame(px, py, cols, rows int, colorIdx int, useFlash
 
 	k.buf.WriteString("\x1b[?2026l")
 	k.activeImgID = targetID
+	k.hasPrev = true
+	k.prevCol0 = col0
+	k.prevRow0 = row0
+	k.prevSrcX = srcX
+	k.prevSrcY = srcY
+	k.prevW = w
+	k.prevH = h
+	k.prevC = c
+	k.prevR = r
+	k.prevHUD = hud
 
 	_, err := k.out.Write(k.buf.Bytes())
 	return err
@@ -272,6 +346,7 @@ func (k *KittyRenderer) DrawFrame(px, py, cols, rows int, colorIdx int, useFlash
 
 // ClearHUDLine erases the bottom status line when toggled off.
 func (k *KittyRenderer) ClearHUDLine(rows int) {
+	k.prevHUD = ""
 	if rows >= 1 {
 		k.buf.Reset()
 		k.buf.WriteString("\x1b[?2026h\x1b[")
@@ -291,28 +366,25 @@ func (k *KittyRenderer) ClearAll() {
 		_, _ = io.WriteString(k.out, "\x1b_Ga=d,d=A,q=2\x1b\\")
 	}
 	k.activeImgID = 0
+	k.hasPrev = false
+	k.prevHUD = ""
 }
 
-// encodeKittyPNG encodes img as PNG and appends base64-chunked Kitty transmission commands (a=t,f=100).
-func (k *KittyRenderer) encodeKittyPNG(id uint32, img image.Image) error {
-	k.pngBuf.Reset()
+func (k *KittyRenderer) encodePNGToBase64(img image.Image) ([]byte, error) {
+	var pngBuf bytes.Buffer
 	enc := png.Encoder{
 		CompressionLevel: png.BestSpeed,
 		BufferPool:       &k.pngPool,
 	}
-	if err := enc.Encode(&k.pngBuf, img); err != nil {
-		return err
+	if err := enc.Encode(&pngBuf, img); err != nil {
+		return nil, err
 	}
+	b64 := make([]byte, base64.StdEncoding.EncodedLen(pngBuf.Len()))
+	base64.StdEncoding.Encode(b64, pngBuf.Bytes())
+	return b64, nil
+}
 
-	encLen := base64.StdEncoding.EncodedLen(k.pngBuf.Len())
-	if cap(k.b64Buf) < encLen {
-		k.b64Buf = make([]byte, encLen)
-	} else {
-		k.b64Buf = k.b64Buf[:encLen]
-	}
-	base64.StdEncoding.Encode(k.b64Buf, k.pngBuf.Bytes())
-	b64 := k.b64Buf
-
+func (k *KittyRenderer) writeBase64Chunks(id uint32, b64 []byte) {
 	chunkSize := 4096
 	if k.tmuxPassthrough {
 		// Keep DCS passthrough packets compact (~1KB) for all tmux versions.
@@ -339,7 +411,6 @@ func (k *KittyRenderer) encodeKittyPNG(id uint32, img image.Image) error {
 		k.buf.Write(b64[offset:end])
 		k.writeAPCEnd()
 	}
-	return nil
 }
 
 func writeUint(dst *bytes.Buffer, v uint64) {
